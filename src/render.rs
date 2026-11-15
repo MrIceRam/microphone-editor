@@ -65,7 +65,7 @@ pub fn render(o: &RenderOptions) -> Result<()> {
     write_wav(&o.output, &out)
 }
 
-fn write_wav(path: &str, samples: &[f32]) -> Result<()> {
+pub fn write_wav(path: &str, samples: &[f32]) -> Result<()> {
     let spec_out = hound::WavSpec {
         channels: 1,
         sample_rate: SAMPLE_RATE,

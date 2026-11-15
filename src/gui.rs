@@ -23,6 +23,9 @@ use crate::notes;
 use crate::piano;
 use crate::state::{CAPTURE_CANCELLED, Shared};
 use crate::theme::{self, LAG, LINE, MUTED, PANEL, RAISED, RAISED_HOVER, SIGNAL, SIGNAL_DIM, SUNKEN, TEXT, WARN};
+use crate::tray::{Tray, TrayAction};
+use crate::tts;
+use crate::twitch::{self, ChatState};
 use crate::virtual_mic::{self, LoopbackResult, VirtualMic};
 
 const CABLE_SITE: &str = "https://vb-audio.com/Cable/";
@@ -79,6 +82,14 @@ pub struct App {
     open_cable_help: bool,
     /// Проверка виртуального микрофона (идёт в отдельном потоке).
     check: Arc<Mutex<CheckState>>,
+    /// Значок в трее (None — не удалось создать, тогда окно ведёт себя обычно).
+    tray: Option<Tray>,
+    /// Окно спрятано в трей.
+    hidden: bool,
+    /// Выход через меню трея (а не сворачивание).
+    quitting: bool,
+    /// Голоса Windows для озвучки.
+    voices: Vec<String>,
 }
 
 /// Состояние проверки виртуального микрофона.
@@ -128,6 +139,17 @@ pub fn apply_to_shared(cfg: &Config, shared: &Shared) {
     shared.piano_transpose.store(cfg.piano.transpose, Ordering::Relaxed);
     shared.monitor_voice.store(cfg.audio.monitor, Ordering::Relaxed);
     shared.monitor_piano.store(cfg.piano.enabled && cfg.piano.monitor, Ordering::Relaxed);
+
+    let t = &cfg.twitch;
+    shared.twitch_enabled.store(t.enabled, Ordering::Relaxed);
+    *shared.twitch_channel.lock().unwrap() = t.channel.clone();
+    *shared.twitch_reward.lock().unwrap() = t.reward_id.clone();
+    *shared.tts_voice.lock().unwrap() = t.voice.clone();
+    shared.tts_volume.set(t.volume as f32 / 100.0);
+    shared.tts_read_name.store(t.read_name, Ordering::Relaxed);
+    shared.tts_max_len.store(t.max_length, Ordering::Relaxed);
+    shared.tts_to_mic.store(t.to_mic, Ordering::Relaxed);
+    shared.tts_to_headphones.store(t.to_headphones, Ordering::Relaxed);
 
     *shared.midi_device.lock().unwrap() = cfg.midi.device.clone();
     let (map, _) = cfg.keymap_table();
@@ -333,8 +355,17 @@ impl App {
         config_warning: Option<String>,
     ) -> Self {
         theme::apply(&cc.egui_ctx);
+        let _ = shared.egui_ctx.set(cc.egui_ctx.clone());
         let (inputs, outputs) = engine::list_devices();
         let last_audio = cfg.audio_settings();
+        let mut config_warning = config_warning;
+        let tray = match Tray::new(&cc.egui_ctx) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                config_warning = Some(format!("Не удалось создать значок в трее: {e:#}"));
+                None
+            }
+        };
         let mut app = Self {
             shared,
             engine,
@@ -353,6 +384,10 @@ impl App {
             screen_octave: 4,
             open_cable_help: false,
             check: Arc::new(Mutex::new(CheckState::Idle)),
+            tray,
+            hidden: false,
+            quitting: false,
+            voices: tts::voice_names(),
         };
         app.check_keymap();
         app
@@ -638,6 +673,10 @@ impl App {
                     .on_hover_text("Если число быстро растёт, увеличь buffer_ms в файле настроек.");
             } else {
                 ui.label(RichText::new("Сбоев звука нет").size(13.0).color(MUTED));
+            }
+            if let Some(now) = self.shared.tts_now.lock().unwrap().clone() {
+                ui.add_space(14.0);
+                ui.label(RichText::new(format!("Озвучиваю: {}", truncate(&now, 40))).size(13.0).color(SIGNAL));
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1162,6 +1201,198 @@ impl App {
         muted(ui, "Например LShift: в Dota это очередь приказов.");
     }
 
+    // --- Вкладка «Twitch» -----------------------------------------------------------
+
+    fn twitch_tab(&mut self, ui: &mut egui::Ui) {
+        // Награда поймана потоком чата — сохраняем.
+        let learned = self.shared.twitch_learned.lock().unwrap().take();
+        if let Some(id) = learned {
+            self.cfg.twitch.reward_id = id;
+            self.mark_dirty();
+        }
+        let status = self.shared.twitch_status.lock().unwrap().clone();
+
+        ui.add_space(8.0);
+        let mut enabled = self.cfg.twitch.enabled;
+        ui.checkbox(&mut enabled, RichText::new("Озвучивать сообщения из награды").font(theme::semibold(16.0)));
+        if enabled != self.cfg.twitch.enabled {
+            self.cfg.twitch.enabled = enabled;
+            self.mark_dirty();
+        }
+        muted(
+            ui,
+            "Зритель берёт награду за баллы канала и пишет текст — его голосом Windows слышат в Discord, \
+             в играх и ты в наушниках. Программа не входит в твой аккаунт Twitch и ничего там не создаёт: \
+             она просто читает чат канала, как любой зритель.",
+        );
+
+        ui.add_enabled_ui(self.cfg.twitch.enabled, |ui| {
+            section(ui, "Канал");
+            ui.horizontal(|ui| {
+                let mut ch = self.cfg.twitch.channel.clone();
+                ui.add(egui::TextEdit::singleline(&mut ch).hint_text("логин, как в twitch.tv/логин").desired_width(240.0));
+                if ch != self.cfg.twitch.channel {
+                    self.cfg.twitch.channel = ch;
+                    self.mark_dirty();
+                }
+                let (color, text) = match &status.state {
+                    ChatState::Connected => (SIGNAL, format!("читаю чат #{}", status.channel)),
+                    ChatState::Connecting => (MUTED, "подключаюсь…".to_string()),
+                    ChatState::Error(e) => (WARN, e.clone()),
+                    ChatState::Off if self.cfg.twitch.channel.trim().is_empty() => (MUTED, "впиши свой канал".to_string()),
+                    ChatState::Off => (MUTED, "выключено".to_string()),
+                };
+                let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                ui.painter().circle_filled(dot.center(), 4.0, color);
+                ui.label(RichText::new(text).color(color).size(13.0));
+            });
+
+            section(ui, "Награда");
+            let learning = self.shared.twitch_learning.load(Ordering::Relaxed);
+            if learning {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        RichText::new(format!(
+                            "Жду награду в чате #{}. Возьми её на своём канале.",
+                            twitch::normalize_channel(&self.cfg.twitch.channel)
+                        ))
+                        .color(WARN),
+                    );
+                    if ui.button("Отмена").clicked() {
+                        self.shared.twitch_learning.store(false, Ordering::Relaxed);
+                    }
+                });
+            } else if self.cfg.twitch.reward_id.is_empty() {
+                ui.label("1. На Twitch: Панель автора → Баллы канала → Управление наградами → «Добавить свою награду».");
+                ui.label("2. Назови её, например, «Сообщение в микрофон» и включи «Требуется ввод текста».");
+                ui.label("3. Нажми кнопку ниже и возьми награду на своём канале один раз.");
+                let can = status.state == ChatState::Connected;
+                if ui
+                    .add_enabled(can, egui::Button::new("Привязать награду"))
+                    .on_disabled_hover_text("Сначала впиши канал и дождись «читаю чат»")
+                    .clicked()
+                {
+                    self.shared.twitch_learning.store(true, Ordering::Relaxed);
+                }
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("✓ Награда привязана").color(SIGNAL));
+                    ui.label(RichText::new(truncate(&self.cfg.twitch.reward_id, 13)).color(MUTED).size(12.5))
+                        .on_hover_text(&self.cfg.twitch.reward_id);
+                    if ui.button("Привязать другую").clicked() {
+                        self.shared.twitch_learning.store(true, Ordering::Relaxed);
+                    }
+                });
+                muted(ui, "Сообщения из других наград и обычный чат программа не читает.");
+            }
+
+            section(ui, "Голос");
+            egui::Grid::new("tts-grid").num_columns(2).min_col_width(150.0).spacing([12.0, 10.0]).show(ui, |ui| {
+                ui.label("Голос");
+                egui::ComboBox::from_id_salt("voice")
+                    .selected_text(if self.cfg.twitch.voice.is_empty() {
+                        "Первый русский".to_string()
+                    } else {
+                        self.cfg.twitch.voice.clone()
+                    })
+                    .show_ui(ui, |ui| {
+                        let mut v = self.cfg.twitch.voice.clone();
+                        ui.selectable_value(&mut v, String::new(), "Первый русский");
+                        for name in &self.voices {
+                            ui.selectable_value(&mut v, name.clone(), name);
+                        }
+                        if v != self.cfg.twitch.voice {
+                            self.cfg.twitch.voice = v;
+                            self.mark_dirty();
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("Громкость");
+                let mut vol = self.cfg.twitch.volume;
+                ui.add(egui::Slider::new(&mut vol, 0..=100).suffix("%"));
+                if vol != self.cfg.twitch.volume {
+                    self.cfg.twitch.volume = vol;
+                    self.mark_dirty();
+                }
+                ui.end_row();
+
+                ui.label("Длина сообщения");
+                let mut len = self.cfg.twitch.max_length;
+                ui.add(egui::Slider::new(&mut len, 20..=500).suffix(" симв."));
+                if len != self.cfg.twitch.max_length {
+                    self.cfg.twitch.max_length = len;
+                    self.mark_dirty();
+                }
+                ui.end_row();
+            });
+
+            let mut read_name = self.cfg.twitch.read_name;
+            ui.checkbox(&mut read_name, "Читать ник: «Вася пишет: привет»");
+            let mut to_mic = self.cfg.twitch.to_mic;
+            ui.checkbox(&mut to_mic, "В Discord и игры (виртуальный микрофон)");
+            let mut to_hp = self.cfg.twitch.to_headphones;
+            ui.checkbox(&mut to_hp, "В наушники (и на стрим, если OBS захватывает звук рабочего стола)");
+            if (read_name, to_mic, to_hp) != (self.cfg.twitch.read_name, self.cfg.twitch.to_mic, self.cfg.twitch.to_headphones) {
+                self.cfg.twitch.read_name = read_name;
+                self.cfg.twitch.to_mic = to_mic;
+                self.cfg.twitch.to_headphones = to_hp;
+                self.mark_dirty();
+            }
+            if ui.button("Проверить голос").clicked() {
+                tts::enqueue(
+                    &self.shared,
+                    tts::Job {
+                        text: "Привет! Так будут звучать сообщения со стрима.".into(),
+                        label: "Проверка голоса".into(),
+                    },
+                );
+            }
+            if let Some(e) = self.shared.tts_error.lock().unwrap().clone() {
+                banner(ui, LAG, &e, None);
+            }
+
+            section(ui, "Очередь");
+            let now = self.shared.tts_now.lock().unwrap().clone();
+            let queued = self.shared.tts_queue_len.load(Ordering::Relaxed);
+            ui.horizontal(|ui| {
+                match &now {
+                    Some(label) => {
+                        ui.label(RichText::new(format!("Говорит: {}", truncate(label, 60))).color(SIGNAL));
+                        if ui.button("Пропустить").clicked() {
+                            self.shared.tts_skip.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    None => muted(ui, "Сейчас тихо."),
+                }
+                if queued > 0 {
+                    ui.label(RichText::new(format!("В очереди: {queued}")).color(MUTED));
+                    if ui.button("Очистить").clicked() {
+                        self.shared.tts_clear.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+            if !status.recent.is_empty() {
+                ui.add_space(4.0);
+                for r in &status.recent {
+                    ui.horizontal(|ui| {
+                        let (mark, color) = if r.spoken { ("озвучено", SIGNAL) } else { ("другая награда", MUTED) };
+                        ui.label(RichText::new(format!("{}: {}", r.user, truncate(&r.text, 60))).color(TEXT));
+                        ui.label(RichText::new(mark).color(color).size(12.5));
+                    });
+                }
+            }
+        });
+
+        ui.add_space(10.0);
+        muted(
+            ui,
+            "Для стрима: в OBS оставь свой обычный микрофон, а в Discord и играх выбери Micro Edition — \
+             тогда на стриме не будет двойного голоса, а озвучка попадёт туда через звук рабочего стола.",
+        );
+    }
+
     // --- Вкладка «Устройства» -----------------------------------------------------
 
     /// Запускает проверку виртуального микрофона в отдельном потоке (~2 секунды).
@@ -1537,7 +1768,56 @@ fn key_chip(ui: &mut egui::Ui, name: &str) {
         });
 }
 
+impl App {
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.hidden = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        self.hidden = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+}
+
 impl eframe::App for App {
+    /// Вызывается каждый кадр и когда окно спрятано в трей.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Программу запустили ещё раз — показываем окно этой копии.
+        if self.shared.show_request.swap(false, Ordering::Relaxed) {
+            self.show_window(ctx);
+        }
+        let lag = self.shared.lag_active();
+        let Some(tray) = self.tray.as_mut() else { return };
+        tray.set_lag(lag);
+        let actions = tray.poll();
+        for a in actions {
+            match a {
+                TrayAction::Show => self.show_window(ctx),
+                TrayAction::ToggleLag => {
+                    self.shared.lag_latched.fetch_xor(true, Ordering::Relaxed);
+                }
+                TrayAction::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+
+        // Крестик и «свернуть» прячут окно в трей, как у Discord.
+        let (close, minimized) = ctx.input(|i| (i.viewport().close_requested(), i.viewport().minimized.unwrap_or(false)));
+        if close && !self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_window(ctx);
+        } else if minimized && !self.hidden {
+            self.hide_window(ctx);
+        }
+        // Значок в трее следит за лагом и когда окно спрятано.
+        ctx.request_repaint_after(Duration::from_millis(250));
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_capture();
         self.poll_check();
@@ -1571,6 +1851,7 @@ impl eframe::App for App {
                     Tab::Lag => self.lag_tab(ui),
                     Tab::Piano => self.piano_tab(ui),
                     Tab::Keys => self.keys_tab(ui),
+                    Tab::Twitch => self.twitch_tab(ui),
                     Tab::Devices => self.devices_tab(ui),
                 });
             });

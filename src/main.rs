@@ -13,8 +13,12 @@ mod notes;
 mod piano;
 mod render;
 mod resample;
+mod single_instance;
 mod state;
 mod theme;
+mod tray;
+mod tts;
+mod twitch;
 mod virtual_mic;
 
 use std::sync::Arc;
@@ -47,6 +51,11 @@ Microphone Editor — микрофон с эффектом лага для Disco
   --piano-demo ВЫХОД.wav [--instrument N]
                                  сыграть короткую мелодию синтезатором
                                  (проверка SoundFont без MIDI-клавиатуры)
+  --say \"ТЕКСТ\" [ВЫХОД.wav] [--voice Pavel]
+                                 озвучить текст голосом Windows в WAV
+  --twitch-watch канал1,канал2 [СЕКУНДЫ]
+                                 почитать чат каналов и показать сообщения
+                                 из наград (проверка связи с Twitch)
 ";
 
 fn main() {
@@ -66,6 +75,10 @@ fn main() {
 }
 
 fn run_gui() -> Result<()> {
+    // Уже запущена (например, свёрнута в трей) — она сама покажет окно.
+    if !single_instance::acquire() {
+        return Ok(());
+    }
     let cfg_path = config::config_path();
     let (cfg, warning) = config::load(&cfg_path);
 
@@ -74,10 +87,19 @@ fn run_gui() -> Result<()> {
     let engine = engine::spawn(shared.clone(), cfg.audio_settings());
     hotkey::spawn(shared.clone());
     midi::spawn(shared.clone());
+    tts::spawn(shared.clone());
+    twitch::spawn(shared.clone());
+    single_instance::listen(shared.clone());
 
+    let icon = eframe::egui::IconData {
+        rgba: tray::icon_rgba(64, false),
+        width: 64,
+        height: 64,
+    };
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Microphone Editor")
+            .with_icon(icon)
             .with_inner_size([700.0, 760.0])
             .with_min_inner_size([560.0, 560.0]),
         ..Default::default()
@@ -124,6 +146,26 @@ fn run_cli(args: &[String]) -> Result<()> {
                 println!("{} -> {}: пик {:.4}, усиление {:+.1} дБ, {verdict}", m.render, m.capture, r.peak, r.gain_db);
             }
             Ok(())
+        }
+        "--say" => {
+            let text = args.get(1).ok_or_else(|| anyhow!("нужно: --say \"текст\" [ВЫХОД.wav] [--voice Pavel]"))?;
+            let out = args.get(2).filter(|a| !a.starts_with("--")).cloned().unwrap_or_else(|| "say.wav".into());
+            let voice = args.iter().position(|a| a == "--voice").and_then(|i| args.get(i + 1)).cloned().unwrap_or_default();
+            let samples = tts::synthesize(text, &voice)?;
+            let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            render::write_wav(&out, &samples)?;
+            println!("Готово: {out} ({:.1} с, пик {peak:.2})", samples.len() as f32 / 48_000.0);
+            Ok(())
+        }
+        "--twitch-watch" => {
+            let channels: Vec<String> = args
+                .get(1)
+                .ok_or_else(|| anyhow!("нужно: --twitch-watch канал1,канал2 [СЕКУНДЫ]"))?
+                .split(',')
+                .map(str::to_string)
+                .collect();
+            let secs = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(30);
+            twitch::watch(&channels, secs).map_err(|e| anyhow!(e))
         }
         "--piano-demo" => {
             let out = args.get(1).ok_or_else(|| anyhow!("нужно: --piano-demo ВЫХОД.wav"))?;

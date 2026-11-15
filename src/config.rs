@@ -25,6 +25,7 @@ pub struct Config {
     pub lag: LagCfg,
     pub hotkey: HotkeyCfg,
     pub ui: UiCfg,
+    pub twitch: TwitchCfg,
     pub piano: PianoCfg,
     pub midi: MidiCfg,
     /// Нота ("C4") -> клавиша ("Q").
@@ -38,17 +39,19 @@ pub enum Tab {
     Lag,
     Piano,
     Keys,
+    Twitch,
     Devices,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Lag, Tab::Piano, Tab::Keys, Tab::Devices];
+    pub const ALL: [Tab; 5] = [Tab::Lag, Tab::Piano, Tab::Keys, Tab::Twitch, Tab::Devices];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::Lag => "Лаг",
             Tab::Piano => "Пианино",
             Tab::Keys => "Клавиши для игр",
+            Tab::Twitch => "Twitch",
             Tab::Devices => "Устройства",
         }
     }
@@ -58,7 +61,38 @@ impl Tab {
             Tab::Lag => "lag",
             Tab::Piano => "piano",
             Tab::Keys => "keys",
+            Tab::Twitch => "twitch",
             Tab::Devices => "devices",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct TwitchCfg {
+    pub enabled: bool,
+    pub channel: String,
+    pub reward_id: String,
+    pub voice: String,
+    pub volume: u32,
+    pub read_name: bool,
+    pub max_length: u32,
+    pub to_mic: bool,
+    pub to_headphones: bool,
+}
+
+impl Default for TwitchCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            channel: String::new(),
+            reward_id: String::new(),
+            voice: String::new(),
+            volume: 80,
+            read_name: true,
+            max_length: 200,
+            to_mic: true,
+            to_headphones: true,
         }
     }
 }
@@ -203,6 +237,9 @@ impl Config {
         p.instrument = p.instrument.min(127);
         p.volume = p.volume.min(100);
         p.transpose = p.transpose.clamp(-24, 24);
+        let t = &mut self.twitch;
+        t.volume = t.volume.min(100);
+        t.max_length = t.max_length.clamp(10, 500);
     }
 
     pub fn audio_settings(&self) -> AudioSettings {
@@ -211,6 +248,7 @@ impl Config {
             output_device: self.audio.output_device.clone(),
             monitor: self.audio.monitor,
             monitor_piano: self.piano.monitor,
+            monitor_tts: self.twitch.enabled && self.twitch.to_headphones,
             monitor_device: self.audio.monitor_device.clone(),
             buffer_ms: self.audio.buffer_ms,
             piano: self.piano.enabled,
@@ -314,6 +352,17 @@ pub fn save(path: &Path, cfg: &Config) -> Result<()> {
     set(&mut doc, "hotkey", "mode", hk_mode.into());
 
     set(&mut doc, "ui", "tab", cfg.ui.tab.config_name().into());
+
+    let t = &cfg.twitch;
+    set(&mut doc, "twitch", "enabled", t.enabled.into());
+    set(&mut doc, "twitch", "channel", t.channel.as_str().into());
+    set(&mut doc, "twitch", "reward_id", t.reward_id.as_str().into());
+    set(&mut doc, "twitch", "voice", t.voice.as_str().into());
+    set(&mut doc, "twitch", "volume", (t.volume as i64).into());
+    set(&mut doc, "twitch", "read_name", t.read_name.into());
+    set(&mut doc, "twitch", "max_length", (t.max_length as i64).into());
+    set(&mut doc, "twitch", "to_mic", t.to_mic.into());
+    set(&mut doc, "twitch", "to_headphones", t.to_headphones.into());
 
     let p = &cfg.piano;
     set(&mut doc, "piano", "enabled", p.enabled.into());

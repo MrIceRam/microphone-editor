@@ -3,11 +3,16 @@
 //! Всё на атомиках, чтобы звуковой поток никогда не ждал блокировок.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI16, AtomicI32, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
+use std::sync::mpsc::Sender;
 
 use crate::keysend::KeyMapper;
 use crate::lag::{LagMode, LagParams};
 use crate::midi::MidiStatus;
+use crate::tts;
+use crate::twitch::TwitchStatus;
 
 /// f32, который можно безопасно менять из разных потоков.
 pub struct AtomicF32(AtomicU32);
@@ -217,6 +222,44 @@ pub struct Shared {
     /// Пойманная нота (-1 — ещё нет).
     pub learned_note: AtomicI16,
     pub keymapper: Mutex<KeyMapper>,
+
+    // --- Twitch ---
+    pub twitch_enabled: AtomicBool,
+    pub twitch_channel: Mutex<String>,
+    /// ID награды, сообщения из которой озвучиваются.
+    pub twitch_reward: Mutex<String>,
+    /// Окно ждёт награду для привязки.
+    pub twitch_learning: AtomicBool,
+    /// Пойманная награда (окно забирает и сохраняет в настройки).
+    pub twitch_learned: Mutex<Option<String>>,
+    pub twitch_status: Mutex<TwitchStatus>,
+
+    // --- Озвучка ---
+    pub tts_jobs: Mutex<Option<Sender<tts::Job>>>,
+    /// Звук озвучки для звукового движка (создаётся движком).
+    pub tts_tx: Mutex<Option<rtrb::Producer<f32>>>,
+    pub tts_queue_len: AtomicUsize,
+    /// Пропустить текущее сообщение.
+    pub tts_skip: AtomicBool,
+    /// Звуковому движку: выкинуть то, что уже в буфере.
+    pub tts_flush: AtomicBool,
+    /// Очистить очередь.
+    pub tts_clear: AtomicBool,
+    /// Что сейчас озвучивается.
+    pub tts_now: Mutex<Option<String>>,
+    pub tts_error: Mutex<Option<String>>,
+    pub tts_voice: Mutex<String>,
+    pub tts_read_name: AtomicBool,
+    pub tts_max_len: AtomicU32,
+    pub tts_volume: AtomicF32,
+    pub tts_to_mic: AtomicBool,
+    pub tts_to_headphones: AtomicBool,
+
+    // --- Окно ---
+    /// Повторный запуск программы просит показать окно из трея.
+    pub show_request: AtomicBool,
+    /// Контекст окна — чтобы будить его из других потоков.
+    pub egui_ctx: std::sync::OnceLock<eframe::egui::Context>,
 }
 
 impl Shared {
@@ -263,6 +306,28 @@ impl Shared {
             learn_note: AtomicBool::new(false),
             learned_note: AtomicI16::new(-1),
             keymapper: Mutex::new(KeyMapper::new()),
+            twitch_enabled: AtomicBool::new(false),
+            twitch_channel: Mutex::new(String::new()),
+            twitch_reward: Mutex::new(String::new()),
+            twitch_learning: AtomicBool::new(false),
+            twitch_learned: Mutex::new(None),
+            twitch_status: Mutex::new(TwitchStatus::default()),
+            tts_jobs: Mutex::new(None),
+            tts_tx: Mutex::new(None),
+            tts_queue_len: AtomicUsize::new(0),
+            tts_skip: AtomicBool::new(false),
+            tts_flush: AtomicBool::new(false),
+            tts_clear: AtomicBool::new(false),
+            tts_now: Mutex::new(None),
+            tts_error: Mutex::new(None),
+            tts_voice: Mutex::new(String::new()),
+            tts_read_name: AtomicBool::new(true),
+            tts_max_len: AtomicU32::new(200),
+            tts_volume: AtomicF32::new(0.8),
+            tts_to_mic: AtomicBool::new(true),
+            tts_to_headphones: AtomicBool::new(true),
+            show_request: AtomicBool::new(false),
+            egui_ctx: std::sync::OnceLock::new(),
         }
     }
 

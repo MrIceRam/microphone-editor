@@ -33,6 +33,8 @@ pub struct AudioSettings {
     pub monitor: bool,
     /// Слышать пианино в наушниках.
     pub monitor_piano: bool,
+    /// Слышать озвучку сообщений в наушниках.
+    pub monitor_tts: bool,
     pub monitor_device: String,
     pub buffer_ms: u32,
     /// Включён ли звук пианино.
@@ -251,7 +253,7 @@ fn start(
     }
 
     // --- Прослушка в наушники (свой голос и/или пианино).
-    if settings.monitor || (settings.monitor_piano && synth.is_some()) {
+    if settings.monitor || (settings.monitor_piano && synth.is_some()) || settings.monitor_tts {
         match find_output(&host, &settings.monitor_device, true) {
             // Наушники = основной выход: там и так всё слышно, второй поток дал бы эхо.
             Ok(Some(dev)) if status.output_name.as_deref() == Some(device_name(&dev).as_str()) => {}
@@ -284,7 +286,10 @@ fn start(
     // Очередь нот: MIDI-поток и окно кладут, звуковой поток забирает.
     let (piano_tx, piano_rx) = rtrb::RingBuffer::new(1024);
     *shared.piano_tx.lock().unwrap() = Some(piano_tx);
-    let processor = Processor::new(in_cfg.sample_rate(), producers, synth, piano_rx, shared.clone())?;
+    // Озвучка сообщений: поток озвучки кладёт звук, звуковой поток забирает.
+    let (tts_tx, tts_rx) = rtrb::RingBuffer::new(crate::tts::TTS_RING);
+    *shared.tts_tx.lock().unwrap() = Some(tts_tx);
+    let processor = Processor::new(in_cfg.sample_rate(), producers, synth, piano_rx, tts_rx, shared.clone())?;
     let in_stream = build_input(&input, &in_cfg, processor, shared.clone())
         .with_context(|| format!("не удалось открыть микрофон «{}»", device_name(&input)))?;
     status.input_name = device_name(&input);
@@ -330,9 +335,12 @@ struct Processor {
     frame_piano: [f32; FRAME],
     /// Что идёт в наушники.
     frame_monitor: [f32; FRAME],
+    /// Озвучка сообщений за текущий пакет.
+    frame_tts: [f32; FRAME],
     lag: LagEngine,
     synth: Option<PianoSynth>,
     piano_rx: rtrb::Consumer<[u8; 3]>,
+    tts_rx: rtrb::Consumer<f32>,
     piano_was_enabled: bool,
     outputs: Vec<(OutputKind, rtrb::Producer<f32>)>,
     shared: Arc<Shared>,
@@ -344,6 +352,7 @@ impl Processor {
         outputs: Vec<(OutputKind, rtrb::Producer<f32>)>,
         synth: Option<PianoSynth>,
         piano_rx: rtrb::Consumer<[u8; 3]>,
+        tts_rx: rtrb::Consumer<f32>,
         shared: Arc<Shared>,
     ) -> Result<Self> {
         Ok(Self {
@@ -354,13 +363,29 @@ impl Processor {
             frame_out: [0.0; FRAME],
             frame_piano: [0.0; FRAME],
             frame_monitor: [0.0; FRAME],
+            frame_tts: [0.0; FRAME],
             lag: LagEngine::new()?,
             synth,
             piano_rx,
+            tts_rx,
             piano_was_enabled: true,
             outputs,
             shared,
         })
+    }
+
+    /// Забирает пакет озвучки в `frame_tts` (или тишину, если говорить нечего).
+    fn take_tts(&mut self) {
+        if self.shared.tts_flush.swap(false, Ordering::Relaxed) {
+            let n = self.tts_rx.slots();
+            if let Ok(chunk) = self.tts_rx.read_chunk(n) {
+                chunk.commit_all();
+            }
+        }
+        let volume = self.shared.tts_volume.get();
+        for s in self.frame_tts.iter_mut() {
+            *s = self.tts_rx.pop().map(|v| v * volume).unwrap_or(0.0);
+        }
     }
 
     /// Забирает ноты из очереди и рендерит пакет пианино в `frame_piano`.
@@ -425,23 +450,38 @@ impl Processor {
                 }
             }
 
+            // Озвучка сообщений — всегда чистая, без лага.
+            self.take_tts();
+            if self.shared.tts_to_mic.load(Ordering::Relaxed) {
+                for (d, t) in self.frame_out.iter_mut().zip(&self.frame_tts) {
+                    *d += t;
+                }
+            }
+
             let mut out_peak = 0.0f32;
             for s in self.frame_out.iter_mut() {
                 *s = s.clamp(-1.0, 1.0);
                 out_peak = out_peak.max(s.abs());
             }
 
-            // В наушники: весь микс (как слышит Discord) или только пианино.
+            // В наушники: весь микс (как слышит Discord) или только пианино и озвучка.
             let monitor_voice = self.shared.monitor_voice.load(Ordering::Relaxed);
             let monitor_piano = self.shared.monitor_piano.load(Ordering::Relaxed);
+            let tts_to_mic = self.shared.tts_to_mic.load(Ordering::Relaxed);
+            let monitor_tts = self.shared.tts_to_headphones.load(Ordering::Relaxed);
             for i in 0..FRAME {
-                self.frame_monitor[i] = if monitor_voice {
+                let mut m = if monitor_voice {
                     self.frame_out[i]
                 } else if monitor_piano {
-                    self.frame_piano[i].clamp(-1.0, 1.0)
+                    self.frame_piano[i]
                 } else {
                     0.0
                 };
+                // Озвучка уже есть в миксе, если слышим себя и она идёт в микрофон.
+                if monitor_tts && !(monitor_voice && tts_to_mic) {
+                    m += self.frame_tts[i];
+                }
+                self.frame_monitor[i] = m.clamp(-1.0, 1.0);
             }
 
             for (kind, prod) in self.outputs.iter_mut() {
