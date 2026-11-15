@@ -350,6 +350,18 @@ impl App {
             );
             ui.end_row();
         });
+
+        // Сбои звука (обрывы буфера) с момента запуска — если растёт, звук рвётся.
+        let glitches: u64 = [&self.shared.input_stats, &self.shared.main_stats, &self.shared.monitor_stats]
+            .iter()
+            .map(|s| s.underruns_total.load(Ordering::Relaxed))
+            .sum();
+        if glitches > 0 {
+            ui.colored_label(ORANGE, format!("Сбоев звука с запуска: {glitches}"))
+                .on_hover_text("Если число быстро растёт — попробуй увеличить buffer_ms в файле настроек.");
+        } else {
+            ui.weak("Сбоев звука нет");
+        }
     }
 
     fn status_block(&mut self, ui: &mut egui::Ui) {

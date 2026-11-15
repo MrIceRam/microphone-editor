@@ -24,6 +24,11 @@ Microphone Editor — микрофон с эффектом лага для Disco
 
 Параметры для проверки:
   --list-devices                 показать звуковые устройства
+  --diagnose [СЕКУНДЫ] [--config ПУТЬ]
+                                 запустить звук с настройками из config.toml
+                                 (выходы пишут тишину) и раз в секунду
+                                 печатать статистику: размеры порций,
+                                 паузы, опустошения буфера
   --render ВХОД.wav ВЫХОД.wav    прогнать WAV-файл через эффект лага
       --mode mix|robot|dropouts|spikes|stutter   (по умолчанию mix)
       --intensity 0..100                         (по умолчанию 60)
@@ -91,6 +96,19 @@ fn run_cli(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
+        "--diagnose" => {
+            let mut seconds = 10u64;
+            let mut cfg_path = config::config_path();
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
+                if a == "--config" {
+                    cfg_path = it.next().ok_or_else(|| anyhow!("нет пути после --config"))?.into();
+                } else {
+                    seconds = a.parse()?;
+                }
+            }
+            run_diagnose(&cfg_path, seconds)
+        }
         "--render" => {
             if args.len() < 3 {
                 bail!("нужно: --render ВХОД.wav ВЫХОД.wav");
@@ -129,6 +147,64 @@ fn run_cli(args: &[String]) -> Result<()> {
         }
         other => bail!("неизвестный параметр {other}\n\n{HELP}"),
     }
+}
+
+fn run_diagnose(cfg_path: &std::path::Path, seconds: u64) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let (cfg, warning) = config::load(cfg_path);
+    if let Some(w) = warning {
+        println!("{w}");
+    }
+    println!("Настройки: {}", cfg_path.display());
+    let shared = Arc::new(state::Shared::new());
+    gui::apply_to_shared(&cfg, &shared);
+    shared.mute_outputs.store(true, Ordering::Relaxed);
+    let engine = engine::spawn(shared.clone(), cfg.audio_settings());
+
+    std::thread::sleep(Duration::from_millis(1500));
+    let st = shared.status();
+    if let Some(e) = &st.error {
+        bail!("звук не запустился: {e}");
+    }
+    println!("Микрофон: {}", st.input_name);
+    println!("Выход:    {}", st.output_name.as_deref().unwrap_or("-"));
+    println!("Прослушка: {}", st.monitor_name.as_deref().unwrap_or("-"));
+    for w in &st.warnings {
+        println!("! {w}");
+    }
+    // Сбрасываем то, что накопилось за запуск.
+    shared.input_stats.take();
+    shared.main_stats.take();
+    shared.monitor_stats.take();
+
+    let ms = |us: u64| us as f64 / 1000.0;
+    let frames = |s: &state::StatsSnapshot| {
+        if s.callbacks == 0 { "-".to_string() } else { format!("{}..{}", s.min_frames, s.max_frames) }
+    };
+    for sec in 1..=seconds {
+        std::thread::sleep(Duration::from_secs(1));
+        let i = shared.input_stats.take();
+        println!(
+            "[{sec:>2}] вход   {} Гц {} кан | вызовов {:>3} | порция {:>9} | пауза макс {:>6.1} мс | обработка макс {:>5.2} мс | сбоев Windows {}",
+            i.sample_rate, i.channels, i.callbacks, frames(&i), ms(i.max_gap_us), ms(i.max_work_us), i.xruns
+        );
+        for (name, stats) in [("кабель", &shared.main_stats), ("наушн.", &shared.monitor_stats)] {
+            let o = stats.take();
+            if o.sample_rate == 0 {
+                continue;
+            }
+            let min_fill = if o.min_fill == u64::MAX { 0 } else { o.min_fill };
+            println!(
+                "     {name} {} Гц {} кан | вызовов {:>3} | порция {:>9} | пауза макс {:>6.1} мс | мин. буфер {:>5} | обрывов {} | тишина {} | выкинуто {} | сбоев Windows {}",
+                o.sample_rate, o.channels, o.callbacks, frames(&o), ms(o.max_gap_us), min_fill, o.underruns, o.silent_callbacks, o.dropped, o.xruns
+            );
+        }
+    }
+    let _ = engine.send(engine::Cmd::Shutdown);
+    std::thread::sleep(Duration::from_millis(300));
+    Ok(())
 }
 
 /// В релизной сборке у программы нет своей консоли — подключаемся к консоли,

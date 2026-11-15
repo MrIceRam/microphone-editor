@@ -72,8 +72,14 @@ impl PullResampler {
     }
 
     /// Заполняет `out` (моно, частота устройства) сэмплами из `src`.
-    pub fn fill(&mut self, src: &mut Consumer<f32>, out: &mut [f32]) {
-        let fill = src.slots() as f64;
+    pub fn fill(&mut self, src: &mut Consumer<f32>, out: &mut [f32]) -> FillReport {
+        let fill_before = src.slots();
+        let fill = fill_before as f64;
+        let mut report = FillReport {
+            fill_before,
+            underrun: false,
+            silent: false,
+        };
 
         if !self.primed {
             if fill >= self.target_fill {
@@ -81,7 +87,8 @@ impl PullResampler {
                 self.avg_fill = fill;
             } else {
                 out.fill(0.0);
-                return;
+                report.silent = true;
+                return report;
             }
         }
 
@@ -113,6 +120,7 @@ impl PullResampler {
                     Err(_) => {
                         // Буфер опустел — ждём, пока снова наберётся запас.
                         self.primed = false;
+                        report.underrun = true;
                         self.pos = 1.0;
                         break;
                     }
@@ -126,7 +134,19 @@ impl PullResampler {
             *o = self.prev + (self.cur - self.prev) * t;
             self.pos += step;
         }
+        report
     }
+}
+
+/// Что произошло за один вызов `PullResampler::fill`.
+#[derive(Debug, Clone, Copy)]
+pub struct FillReport {
+    /// Сколько сэмплов было в буфере перед чтением.
+    pub fill_before: usize,
+    /// Буфер опустел посреди звука — слышимый обрыв.
+    pub underrun: bool,
+    /// Весь вызов — тишина (ждём наполнения буфера).
+    pub silent: bool,
 }
 
 #[cfg(test)]

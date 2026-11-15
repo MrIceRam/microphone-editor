@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -20,7 +20,7 @@ use cpal::{FromSample, SampleFormat, SizedSample};
 
 use crate::lag::{FRAME, LagEngine, SAMPLE_RATE};
 use crate::resample::{PullResampler, PushResampler};
-use crate::state::{AtomicF32, EngineStatus, Shared};
+use crate::state::{AtomicF32, EngineStatus, Shared, StreamStats};
 
 /// Настройки устройств (то, что требует переоткрыть звук).
 #[derive(Clone, Debug, PartialEq)]
@@ -79,6 +79,8 @@ fn engine_thread(shared: Arc<Shared>, mut settings: AudioSettings, rx: Receiver<
             Err(RecvTimeoutError::Timeout) => {
                 if shared.stream_failed.swap(false, Ordering::Relaxed) {
                     // Устройство отвалилось (выдернули, сменили формат в Windows...).
+                    // Небольшая пауза, чтобы Windows успела «отпустить» устройство.
+                    thread::sleep(Duration::from_secs(1));
                     need_start = true;
                 }
             }
@@ -166,7 +168,7 @@ fn start(settings: &AudioSettings, shared: &Arc<Shared>) -> Result<(Vec<cpal::St
             match build_output(&dev, cons, target_fill, shared.clone(), OutputKind::Main) {
                 Ok(s) => {
                     streams.push(s);
-                    producers.push(prod);
+                    producers.push((OutputKind::Main, prod));
                     status.output_name = Some(device_name(&dev));
                 }
                 Err(e) => status.warnings.push(format!("Не удалось открыть выход «{}»: {e:#}", device_name(&dev))),
@@ -190,7 +192,7 @@ fn start(settings: &AudioSettings, shared: &Arc<Shared>) -> Result<(Vec<cpal::St
                 match build_output(&dev, cons, target_fill, shared.clone(), OutputKind::Monitor) {
                     Ok(s) => {
                         streams.push(s);
-                        producers.push(prod);
+                        producers.push((OutputKind::Monitor, prod));
                         status.monitor_name = Some(device_name(&dev));
                     }
                     Err(e) => status.warnings.push(format!("Не удалось открыть наушники: {e:#}")),
@@ -206,6 +208,8 @@ fn start(settings: &AudioSettings, shared: &Arc<Shared>) -> Result<(Vec<cpal::St
     let in_cfg = input
         .default_input_config()
         .with_context(|| format!("не удалось узнать формат микрофона «{}»", device_name(&input)))?;
+    shared.input_stats.sample_rate.store(in_cfg.sample_rate(), Ordering::Relaxed);
+    shared.input_stats.channels.store(in_cfg.channels() as u32, Ordering::Relaxed);
     let processor = Processor::new(in_cfg.sample_rate(), producers, shared.clone())?;
     let in_stream = build_input(&input, &in_cfg, processor, shared.clone())
         .with_context(|| format!("не удалось открыть микрофон «{}»", device_name(&input)))?;
@@ -227,12 +231,12 @@ struct Processor {
     frame_in: [f32; FRAME],
     frame_out: [f32; FRAME],
     lag: LagEngine,
-    outputs: Vec<rtrb::Producer<f32>>,
+    outputs: Vec<(OutputKind, rtrb::Producer<f32>)>,
     shared: Arc<Shared>,
 }
 
 impl Processor {
-    fn new(in_rate: u32, outputs: Vec<rtrb::Producer<f32>>, shared: Arc<Shared>) -> Result<Self> {
+    fn new(in_rate: u32, outputs: Vec<(OutputKind, rtrb::Producer<f32>)>, shared: Arc<Shared>) -> Result<Self> {
         Ok(Self {
             resampler: PushResampler::new(in_rate, SAMPLE_RATE),
             mono: Vec::with_capacity(8192),
@@ -266,11 +270,13 @@ impl Processor {
                 *s = s.clamp(-1.0, 1.0);
                 out_peak = out_peak.max(s.abs());
             }
-            for prod in self.outputs.iter_mut() {
+            for (kind, prod) in self.outputs.iter_mut() {
                 if prod.slots() >= FRAME {
                     for &s in self.frame_out.iter() {
                         let _ = prod.push(s);
                     }
+                } else {
+                    stats_for(&self.shared, *kind).dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
             update_level(&self.shared.in_level, in_peak);
@@ -315,23 +321,59 @@ where
     f32: FromSample<T>,
 {
     let channels = config.channels.max(1) as usize;
+    let mut last_call: Option<Instant> = None;
     let stream = dev.build_input_stream::<T, _, _>(
         config,
         move |data: &[T], _| {
+            let started = Instant::now();
+            let gap_us = last_call.map(|t| (started - t).as_micros() as u64).unwrap_or(0);
+            last_call = Some(started);
+
             processor.mono.clear();
             for frame in data.chunks_exact(channels) {
                 let sum: f32 = frame.iter().map(|s| s.to_sample::<f32>()).sum();
                 processor.mono.push(sum / channels as f32);
             }
             processor.process();
+
+            let work_us = started.elapsed().as_micros() as u64;
+            processor
+                .shared
+                .input_stats
+                .on_callback(data.len() / channels, gap_us, work_us);
         },
-        move |err| {
-            eprintln!("Ошибка микрофона: {err}");
-            shared.stream_failed.store(true, Ordering::Relaxed);
-        },
+        move |err| handle_stream_error(&shared, &shared.input_stats, "микрофон", err),
         None,
     )?;
     Ok(stream)
+}
+
+/// Ошибки звуковых потоков. Сбой буфера (Xrun) — не поломка: Windows просто
+/// сообщает, что потерялся кусочек звука. Его только считаем. Перезапускаем
+/// звук лишь когда устройство действительно пропало или сменилось.
+fn handle_stream_error(shared: &Shared, stats: &StreamStats, what: &str, err: cpal::Error) {
+    use cpal::ErrorKind;
+    match err.kind() {
+        ErrorKind::Xrun => {
+            stats.xruns.fetch_add(1, Ordering::Relaxed);
+            stats.underruns_total.fetch_add(1, Ordering::Relaxed);
+        }
+        ErrorKind::DeviceNotAvailable
+        | ErrorKind::StreamInvalidated
+        | ErrorKind::DeviceChanged
+        | ErrorKind::BackendError => {
+            eprintln!("Ошибка ({what}): {err} — переподключаюсь");
+            shared.stream_failed.store(true, Ordering::Relaxed);
+        }
+        _ => eprintln!("Предупреждение ({what}): {err}"),
+    }
+}
+
+fn stats_for(shared: &Shared, kind: OutputKind) -> &StreamStats {
+    match kind {
+        OutputKind::Main => &shared.main_stats,
+        OutputKind::Monitor => &shared.monitor_stats,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -373,28 +415,48 @@ where
     T: SizedSample + FromSample<f32>,
 {
     let channels = config.channels.max(1) as usize;
+    let stats = stats_for(&shared, kind);
+    stats.sample_rate.store(config.sample_rate, Ordering::Relaxed);
+    stats.channels.store(channels as u32, Ordering::Relaxed);
     let mut resampler = PullResampler::new(SAMPLE_RATE, config.sample_rate, target_fill);
     let mut mono: Vec<f32> = Vec::with_capacity(8192);
+    let mut last_call: Option<Instant> = None;
     let data_shared = shared.clone();
     let stream = dev.build_output_stream::<T, _, _>(
         config,
         move |data: &mut [T], _| {
+            let started = Instant::now();
+            let gap_us = last_call.map(|t| (started - t).as_micros() as u64).unwrap_or(0);
+            last_call = Some(started);
+
             let frames = data.len() / channels;
             mono.resize(frames, 0.0);
-            resampler.fill(&mut cons, &mut mono);
-            let volume = match kind {
-                OutputKind::Main => 1.0,
-                OutputKind::Monitor => data_shared.monitor_volume.get(),
+            let report = resampler.fill(&mut cons, &mut mono);
+            let volume = if data_shared.mute_outputs.load(Ordering::Relaxed) {
+                0.0
+            } else {
+                match kind {
+                    OutputKind::Main => 1.0,
+                    OutputKind::Monitor => data_shared.monitor_volume.get(),
+                }
             };
             for (frame, &s) in data.chunks_exact_mut(channels).zip(mono.iter()) {
                 let v = T::from_sample(s * volume);
                 frame.fill(v);
             }
+
+            let stats = stats_for(&data_shared, kind);
+            stats.on_callback(frames, gap_us, started.elapsed().as_micros() as u64);
+            stats.min_fill.fetch_min(report.fill_before as u64, Ordering::Relaxed);
+            if report.underrun {
+                stats.underruns.fetch_add(1, Ordering::Relaxed);
+                stats.underruns_total.fetch_add(1, Ordering::Relaxed);
+            }
+            if report.silent {
+                stats.silent_callbacks.fetch_add(1, Ordering::Relaxed);
+            }
         },
-        move |err| {
-            eprintln!("Ошибка вывода звука: {err}");
-            shared.stream_failed.store(true, Ordering::Relaxed);
-        },
+        move |err| handle_stream_error(&shared, stats_for(&shared, kind), "выход", err),
         None,
     )?;
     Ok(stream)
