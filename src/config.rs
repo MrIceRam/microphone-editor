@@ -24,10 +24,49 @@ pub struct Config {
     pub audio: AudioCfg,
     pub lag: LagCfg,
     pub hotkey: HotkeyCfg,
+    pub ui: UiCfg,
     pub piano: PianoCfg,
     pub midi: MidiCfg,
     /// Нота ("C4") -> клавиша ("Q").
     pub keymap: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Tab {
+    #[default]
+    Lag,
+    Piano,
+    Keys,
+    Devices,
+}
+
+impl Tab {
+    pub const ALL: [Tab; 4] = [Tab::Lag, Tab::Piano, Tab::Keys, Tab::Devices];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Lag => "Лаг",
+            Tab::Piano => "Пианино",
+            Tab::Keys => "Клавиши для игр",
+            Tab::Devices => "Устройства",
+        }
+    }
+
+    fn config_name(self) -> &'static str {
+        match self {
+            Tab::Lag => "lag",
+            Tab::Piano => "piano",
+            Tab::Keys => "keys",
+            Tab::Devices => "devices",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(default)]
+pub struct UiCfg {
+    pub tab: Tab,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -69,6 +108,8 @@ pub struct MidiCfg {
 pub struct AudioCfg {
     pub input_device: String,
     pub output_device: String,
+    pub cable_gain_db: f32,
+    pub cable_gain_device: String,
     pub input_gain_db: f32,
     pub monitor: bool,
     pub monitor_device: String,
@@ -80,7 +121,9 @@ impl Default for AudioCfg {
     fn default() -> Self {
         Self {
             input_device: String::new(),
-            output_device: "CABLE Input".into(),
+            output_device: String::new(),
+            cable_gain_db: 0.0,
+            cable_gain_device: String::new(),
             input_gain_db: 0.0,
             monitor: false,
             monitor_device: String::new(),
@@ -149,6 +192,7 @@ impl Config {
     pub fn sanitize(&mut self) {
         let a = &mut self.audio;
         a.input_gain_db = a.input_gain_db.clamp(-24.0, 36.0);
+        a.cable_gain_db = a.cable_gain_db.clamp(-20.0, 60.0);
         a.monitor_volume = a.monitor_volume.min(100);
         a.buffer_ms = a.buffer_ms.clamp(10, 300);
         let l = &mut self.lag;
@@ -251,6 +295,8 @@ pub fn save(path: &Path, cfg: &Config) -> Result<()> {
     let a = &cfg.audio;
     set(&mut doc, "audio", "input_device", a.input_device.as_str().into());
     set(&mut doc, "audio", "output_device", a.output_device.as_str().into());
+    set(&mut doc, "audio", "cable_gain_db", round2(a.cable_gain_db).into());
+    set(&mut doc, "audio", "cable_gain_device", a.cable_gain_device.as_str().into());
     set(&mut doc, "audio", "input_gain_db", round2(a.input_gain_db).into());
     set(&mut doc, "audio", "monitor", a.monitor.into());
     set(&mut doc, "audio", "monitor_device", a.monitor_device.as_str().into());
@@ -266,6 +312,8 @@ pub fn save(path: &Path, cfg: &Config) -> Result<()> {
 
     set(&mut doc, "hotkey", "key", cfg.hotkey.key.as_str().into());
     set(&mut doc, "hotkey", "mode", hk_mode.into());
+
+    set(&mut doc, "ui", "tab", cfg.ui.tab.config_name().into());
 
     let p = &cfg.piano;
     set(&mut doc, "piano", "enabled", p.enabled.into());
@@ -347,6 +395,7 @@ mod tests {
         cfg.lag.catchup_speed = 2.1;
         cfg.hotkey.key = "Mouse4".into();
         cfg.hotkey.mode = HotkeyMode::Toggle;
+        cfg.ui.tab = Tab::Keys;
         cfg.piano.instrument = 4;
         cfg.piano.transpose = -12;
         cfg.midi.send_keys = true;

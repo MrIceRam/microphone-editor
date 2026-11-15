@@ -14,6 +14,8 @@ mod piano;
 mod render;
 mod resample;
 mod state;
+mod theme;
+mod virtual_mic;
 
 use std::sync::Arc;
 
@@ -28,6 +30,8 @@ Microphone Editor — микрофон с эффектом лага для Disco
 
 Параметры для проверки:
   --list-devices                 показать звуковые устройства
+  --loopback-test                проверить виртуальные микрофоны: проходит ли
+                                 звук и на сколько дБ кабель его усиливает
   --diagnose [СЕКУНДЫ] [--config ПУТЬ]
                                  запустить звук с настройками из config.toml
                                  (выходы пишут тишину) и раз в секунду
@@ -74,8 +78,8 @@ fn run_gui() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Microphone Editor")
-            .with_inner_size([600.0, 900.0])
-            .with_min_inner_size([480.0, 400.0]),
+            .with_inner_size([700.0, 760.0])
+            .with_min_inner_size([560.0, 560.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -95,12 +99,29 @@ fn run_cli(args: &[String]) -> Result<()> {
         "--list-devices" => {
             let (inputs, outputs) = engine::list_devices();
             println!("Микрофоны (входы):");
-            for n in inputs {
+            for n in &inputs {
                 println!("  {n}");
             }
             println!("Выходы:");
-            for n in outputs {
+            for n in &outputs {
                 println!("  {n}");
+            }
+            println!("Виртуальные микрофоны:");
+            for m in virtual_mic::pair_virtual_mics(&inputs, &outputs) {
+                println!("  {} -> {}", m.render, m.capture);
+            }
+            Ok(())
+        }
+        "--loopback-test" => {
+            let (inputs, outputs) = engine::list_devices();
+            let mics = virtual_mic::pair_virtual_mics(&inputs, &outputs);
+            if mics.is_empty() {
+                bail!("виртуальных микрофонов не найдено");
+            }
+            for m in mics {
+                let r = virtual_mic::loopback_test(&m.render, &m.capture)?;
+                let verdict = if r.works() { "звук проходит" } else { "звук НЕ проходит" };
+                println!("{} -> {}: пик {:.4}, усиление {:+.1} дБ, {verdict}", m.render, m.capture, r.peak, r.gain_db);
             }
             Ok(())
         }

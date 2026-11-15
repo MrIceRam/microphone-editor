@@ -22,6 +22,7 @@ use crate::lag::{FRAME, LagEngine, SAMPLE_RATE};
 use crate::piano::{self, PianoSynth};
 use crate::resample::{PullResampler, PushResampler};
 use crate::state::{AtomicF32, EngineStatus, Shared, StreamStats};
+use crate::virtual_mic;
 
 /// Настройки устройств (то, что требует переоткрыть звук).
 #[derive(Clone, Debug, PartialEq)]
@@ -126,7 +127,7 @@ pub fn list_devices() -> (Vec<String>, Vec<String>) {
 }
 
 /// Ищет устройство: сначала точное совпадение названия, потом по части названия.
-fn find_device(devices: Vec<cpal::Device>, wanted: &str) -> Option<cpal::Device> {
+pub(crate) fn find_device(devices: Vec<cpal::Device>, wanted: &str) -> Option<cpal::Device> {
     let wanted_lc = wanted.trim().to_lowercase();
     let named: Vec<(String, cpal::Device)> = devices
         .into_iter()
@@ -141,14 +142,38 @@ fn find_device(devices: Vec<cpal::Device>, wanted: &str) -> Option<cpal::Device>
         .map(|(_, d)| d)
 }
 
-fn find_input(host: &cpal::Host, wanted: &str) -> Result<cpal::Device> {
+/// Ищет микрофон. `cable_driver` — драйвер виртуального кабеля, в который пишет
+/// программа: его микрофон брать нельзя, иначе программа будет слушать сама себя.
+/// Второе значение — предупреждение для окна.
+fn find_input(host: &cpal::Host, wanted: &str, cable_driver: Option<&str>) -> Result<(cpal::Device, Option<String>)> {
+    let is_loop = |d: &cpal::Device| {
+        let name = device_name(d);
+        cable_driver.is_some() && virtual_mic::driver_part(&name) == cable_driver
+    };
     if wanted.trim().is_empty() {
-        return host
+        let default = host
             .default_input_device()
-            .ok_or_else(|| anyhow!("В Windows не выбран микрофон по умолчанию"));
+            .ok_or_else(|| anyhow!("В Windows не выбран микрофон по умолчанию"))?;
+        if !is_loop(&default) {
+            return Ok((default, None));
+        }
+        // Микрофон по умолчанию в Windows — наш же виртуальный. Берём настоящий.
+        let real = host
+            .input_devices()?
+            .find(|d| !is_loop(d) && !virtual_mic::driver_part(&device_name(d)).is_some_and(virtual_mic::is_virtual_driver))
+            .ok_or_else(|| anyhow!("Не нашёл настоящий микрофон: в Windows по умолчанию стоит виртуальный"))?;
+        let warn = format!(
+            "В Windows по умолчанию стоит виртуальный микрофон, поэтому программа слушает «{}». Выбери свой микрофон на вкладке «Устройства».",
+            device_name(&real)
+        );
+        return Ok((real, Some(warn)));
     }
     let devices: Vec<_> = host.input_devices()?.collect();
-    find_device(devices, wanted).ok_or_else(|| anyhow!("Микрофон «{wanted}» не найден"))
+    let dev = find_device(devices, wanted).ok_or_else(|| anyhow!("Микрофон «{wanted}» не найден"))?;
+    if is_loop(&dev) {
+        bail!("Микрофон программы — это её же виртуальный микрофон «{}», получилось бы эхо. Выбери настоящий микрофон", device_name(&dev));
+    }
+    Ok((dev, None))
 }
 
 fn find_output(host: &cpal::Host, wanted: &str, allow_default: bool) -> Result<Option<cpal::Device>> {
@@ -193,8 +218,16 @@ fn start(
         None
     };
 
-    // --- Выход в виртуальный кабель.
-    match find_output(&host, &settings.output_device, false) {
+    // --- Выход в виртуальный кабель (пусто = найти автоматически).
+    let (in_names, out_names) = list_devices();
+    let mics = virtual_mic::pair_virtual_mics(&in_names, &out_names);
+    let output_wanted = if settings.output_device.trim().is_empty() {
+        mics.first().map(|m| m.render.clone()).unwrap_or_default()
+    } else {
+        settings.output_device.clone()
+    };
+    let pair = virtual_mic::pair_for_output(&mics, &output_wanted).cloned();
+    match find_output(&host, &output_wanted, false) {
         Ok(Some(dev)) => {
             let (prod, cons) = rtrb::RingBuffer::new(RING_CAPACITY);
             match build_output(&dev, cons, target_fill, shared.clone(), OutputKind::Main) {
@@ -202,13 +235,14 @@ fn start(
                     streams.push(s);
                     producers.push((OutputKind::Main, prod));
                     status.output_name = Some(device_name(&dev));
+                    status.virtual_capture = pair.as_ref().map(|p| p.capture.clone());
                 }
                 Err(e) => status.warnings.push(format!("Не удалось открыть выход «{}»: {e:#}", device_name(&dev))),
             }
         }
-        Ok(None) if settings.output_device.trim().is_empty() => {
-            status.warnings.push("Не выбран выход. Выбери «CABLE Input (VB-Audio Virtual Cable)».".into())
-        }
+        Ok(None) if settings.output_device.trim().is_empty() => status.warnings.push(
+            "Не найден выход: в системе нет виртуального микрофона (VB-Audio Virtual Cable или Steam Streaming Microphone).".into(),
+        ),
         Ok(None) => status.warnings.push(format!(
             "Не найден выход «{}». Установи VB-Audio Virtual Cable (vb-audio.com) и перезагрузи компьютер.",
             settings.output_device
@@ -238,7 +272,10 @@ fn start(
     }
 
     // --- Микрофон (без него работать нечему — это уже ошибка).
-    let input = find_input(&host, &settings.input_device)?;
+    let cable_driver = status.output_name.as_deref().and_then(virtual_mic::driver_part).map(str::to_string);
+    let cable_driver = cable_driver.filter(|d| virtual_mic::is_virtual_driver(d));
+    let (input, input_warning) = find_input(&host, &settings.input_device, cable_driver.as_deref())?;
+    status.warnings.extend(input_warning);
     let in_cfg = input
         .default_input_config()
         .with_context(|| format!("не удалось узнать формат микрофона «{}»", device_name(&input)))?;
@@ -579,7 +616,7 @@ where
                 0.0
             } else {
                 match kind {
-                    OutputKind::Main => 1.0,
+                    OutputKind::Main => data_shared.main_gain.get(),
                     OutputKind::Monitor => data_shared.monitor_volume.get(),
                 }
             };

@@ -86,11 +86,11 @@ impl LagMode {
 
     pub fn description(self) -> &'static str {
         match self {
-            LagMode::Mix => "всё вперемешку, как при реально плохой связи",
-            LagMode::Robot => "потеря пакетов: металлический роботный голос",
-            LagMode::Dropouts => "голос пропадает кусками",
-            LagMode::Spikes => "голос замирает, потом догоняет",
-            LagMode::Stutter => "«п-п-п-привет»",
+            LagMode::Mix => "всё вперемешку",
+            LagMode::Robot => "металлический голос",
+            LagMode::Dropouts => "голос рвётся кусками",
+            LagMode::Spikes => "замирает и догоняет",
+            LagMode::Stutter => "п-п-п-привет",
         }
     }
 }

@@ -133,6 +133,8 @@ pub struct EngineStatus {
     pub warnings: Vec<String>,
     pub input_name: String,
     pub output_name: Option<String>,
+    /// Если выход — виртуальный кабель: его микрофон (его выбирают в Discord и играх).
+    pub virtual_capture: Option<String>,
     pub monitor_name: Option<String>,
     /// Загруженный SoundFont (если пианино со звуком).
     pub soundfont_name: Option<String>,
@@ -156,6 +158,8 @@ pub struct Shared {
     pub input_gain: AtomicF32,
     /// Громкость прослушки 0..1.
     pub monitor_volume: AtomicF32,
+    /// Множитель для основного выхода — компенсирует усиление виртуального кабеля.
+    pub main_gain: AtomicF32,
 
     // --- Индикаторы для окна ---
     pub in_level: AtomicF32,
@@ -227,6 +231,7 @@ impl Shared {
             bitrate: AtomicI32::new(64_000),
             input_gain: AtomicF32::new(1.0),
             monitor_volume: AtomicF32::new(0.8),
+            main_gain: AtomicF32::new(1.0),
             in_level: AtomicF32::new(0.0),
             out_level: AtomicF32::new(0.0),
             lag_wet: AtomicF32::new(0.0),
