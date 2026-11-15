@@ -1,0 +1,16 @@
+[package]
+name = "microphone-editor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+cpal = "0.18"
+eframe = "0.37"
+hound = "3.5"
+opus = "0.4"
+rtrb = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+toml_edit = "0.25"
+windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_System_Console"] }
