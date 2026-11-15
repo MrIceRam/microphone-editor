@@ -6,6 +6,7 @@
 use anyhow::{Context, Result, bail};
 
 use crate::lag::{FRAME, LagEngine, LagMode, LagParams, SAMPLE_RATE};
+use crate::piano::{self, PianoSynth};
 use crate::resample::PushResampler;
 
 pub struct RenderOptions {
@@ -61,16 +62,57 @@ pub fn render(o: &RenderOptions) -> Result<()> {
         lag.process(&resampled[r.clone()], &mut out[r], &p);
     }
 
+    write_wav(&o.output, &out)
+}
+
+fn write_wav(path: &str, samples: &[f32]) -> Result<()> {
     let spec_out = hound::WavSpec {
         channels: 1,
         sample_rate: SAMPLE_RATE,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer = hound::WavWriter::create(&o.output, spec_out).with_context(|| format!("не создать {}", o.output))?;
-    for s in out {
+    let mut writer = hound::WavWriter::create(path, spec_out).with_context(|| format!("не создать {path}"))?;
+    for &s in samples {
         writer.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)?;
     }
     writer.finalize()?;
     Ok(())
+}
+
+/// Короткая мелодия синтезатором — проверить, что SoundFont звучит.
+pub fn piano_demo(output: &str, instrument: u8) -> Result<()> {
+    let path = piano::resolve_soundfont("").ok_or_else(|| anyhow::anyhow!("нет .sf2 в папке soundfonts"))?;
+    println!("SoundFont: {}", path.display());
+    let sf = piano::load_soundfont(&path)?;
+    let mut synth = PianoSynth::new(&sf)?;
+    synth.set_program(instrument);
+
+    // (нота, начало в пакетах по 20 мс, длительность в пакетах)
+    let melody: &[(u8, usize, usize)] = &[
+        (60, 0, 12),
+        (64, 12, 12),
+        (67, 24, 12),
+        (72, 36, 24),
+        (60, 70, 50),
+        (64, 70, 50),
+        (67, 70, 50),
+        (72, 70, 50),
+    ];
+    let frames = 170;
+    let mut out = vec![0.0f32; frames * FRAME];
+    for f in 0..frames {
+        for &(n, start, len) in melody {
+            if f == start {
+                synth.handle([0x90, n, 100], 0);
+            }
+            if f == start + len {
+                synth.handle([0x80, n, 0], 0);
+            }
+        }
+        synth.render(&mut out[f * FRAME..(f + 1) * FRAME]);
+    }
+    let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    println!("Пик громкости: {peak:.3}");
+    write_wav(output, &out)
 }

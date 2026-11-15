@@ -3,6 +3,7 @@
 //! Читается через serde, а сохраняется через toml_edit — так комментарии
 //! и порядок строк в файле остаются как были.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -12,6 +13,7 @@ use toml_edit::{DocumentMut, Item, Value};
 
 use crate::engine::AudioSettings;
 use crate::lag::LagMode;
+use crate::{keys, notes};
 
 /// Шаблон файла настроек с комментариями.
 pub const TEMPLATE: &str = include_str!("default_config.toml");
@@ -22,6 +24,44 @@ pub struct Config {
     pub audio: AudioCfg,
     pub lag: LagCfg,
     pub hotkey: HotkeyCfg,
+    pub piano: PianoCfg,
+    pub midi: MidiCfg,
+    /// Нота ("C4") -> клавиша ("Q").
+    pub keymap: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct PianoCfg {
+    pub enabled: bool,
+    pub soundfont: String,
+    pub instrument: u8,
+    pub volume: u32,
+    pub monitor: bool,
+    pub through_lag: bool,
+    pub transpose: i32,
+}
+
+impl Default for PianoCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            soundfont: String::new(),
+            instrument: 0,
+            volume: 70,
+            monitor: true,
+            through_lag: false,
+            transpose: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(default)]
+pub struct MidiCfg {
+    pub device: String,
+    pub send_keys: bool,
+    pub pedal_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -115,6 +155,10 @@ impl Config {
         l.intensity = l.intensity.min(100);
         l.catchup_speed = l.catchup_speed.clamp(1.1, 3.0);
         l.bitrate = l.bitrate.clamp(6_000, 256_000);
+        let p = &mut self.piano;
+        p.instrument = p.instrument.min(127);
+        p.volume = p.volume.min(100);
+        p.transpose = p.transpose.clamp(-24, 24);
     }
 
     pub fn audio_settings(&self) -> AudioSettings {
@@ -122,9 +166,26 @@ impl Config {
             input_device: self.audio.input_device.clone(),
             output_device: self.audio.output_device.clone(),
             monitor: self.audio.monitor,
+            monitor_piano: self.piano.monitor,
             monitor_device: self.audio.monitor_device.clone(),
             buffer_ms: self.audio.buffer_ms,
+            piano: self.piano.enabled,
+            soundfont: self.piano.soundfont.clone(),
         }
+    }
+
+    /// Привязки в виде таблицы нота -> код клавиши. Второе значение — строки,
+    /// которые не удалось разобрать (для предупреждения).
+    pub fn keymap_table(&self) -> ([u16; 128], Vec<String>) {
+        let mut map = [0u16; 128];
+        let mut bad = Vec::new();
+        for (note, key) in &self.keymap {
+            match (notes::parse_note(note), keys::parse_key(key)) {
+                (Some(n), Some(vk)) => map[n as usize] = vk,
+                _ => bad.push(format!("{note} = \"{key}\"")),
+            }
+        }
+        (map, bad)
     }
 }
 
@@ -206,6 +267,34 @@ pub fn save(path: &Path, cfg: &Config) -> Result<()> {
     set(&mut doc, "hotkey", "key", cfg.hotkey.key.as_str().into());
     set(&mut doc, "hotkey", "mode", hk_mode.into());
 
+    let p = &cfg.piano;
+    set(&mut doc, "piano", "enabled", p.enabled.into());
+    set(&mut doc, "piano", "soundfont", p.soundfont.as_str().into());
+    set(&mut doc, "piano", "instrument", (p.instrument as i64).into());
+    set(&mut doc, "piano", "volume", (p.volume as i64).into());
+    set(&mut doc, "piano", "monitor", p.monitor.into());
+    set(&mut doc, "piano", "through_lag", p.through_lag.into());
+    set(&mut doc, "piano", "transpose", (p.transpose as i64).into());
+
+    let m = &cfg.midi;
+    set(&mut doc, "midi", "device", m.device.as_str().into());
+    set(&mut doc, "midi", "send_keys", m.send_keys.into());
+    set(&mut doc, "midi", "pedal_key", m.pedal_key.as_str().into());
+
+    // Привязки переписываем целиком, по возрастанию нот.
+    let root = doc.as_table_mut();
+    if !root.contains_key("keymap") {
+        root.insert("keymap", toml_edit::table());
+    }
+    if let Some(tbl) = root.get_mut("keymap").and_then(Item::as_table_mut) {
+        tbl.clear();
+        let mut entries: Vec<(&String, &String)> = cfg.keymap.iter().collect();
+        entries.sort_by_key(|(n, _)| notes::parse_note(n).map(i32::from).unwrap_or(1000));
+        for (note, key) in entries {
+            tbl.insert(note, toml_edit::value(key.as_str()));
+        }
+    }
+
     fs::write(path, doc.to_string()).with_context(|| format!("не удалось записать {}", path.display()))
 }
 
@@ -258,12 +347,25 @@ mod tests {
         cfg.lag.catchup_speed = 2.1;
         cfg.hotkey.key = "Mouse4".into();
         cfg.hotkey.mode = HotkeyMode::Toggle;
+        cfg.piano.instrument = 4;
+        cfg.piano.transpose = -12;
+        cfg.midi.send_keys = true;
+        cfg.midi.pedal_key = "LShift".into();
+        cfg.keymap.insert("E4".into(), "W".into());
+        cfg.keymap.insert("C#4".into(), "Mouse2".into());
+        cfg.keymap.insert("C4".into(), "Q".into());
         save(&path, &cfg).unwrap();
 
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("# Режим лага:"), "комментарии пропали:\n{text}");
+        assert!(text.contains("# Привязки «нота = клавиша»"), "комментарий keymap пропал:\n{text}");
         assert!(text.contains("mode = \"stutter\""), "{text}");
         assert!(text.contains("catchup_speed = 2.1\n"), "{text}");
+        assert!(text.contains("[keymap]\nC4 = \"Q\"\n\"C#4\" = \"Mouse2\"\nE4 = \"W\""), "{text}");
+        let (map, bad) = cfg.keymap_table();
+        assert!(bad.is_empty());
+        assert_eq!(map[60], 0x51);
+        assert_eq!(map[61], 0x02);
         let (loaded, warn) = load(&path);
         assert!(warn.is_none());
         assert_eq!(loaded, cfg);

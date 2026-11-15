@@ -6,7 +6,11 @@ mod engine;
 mod gui;
 mod hotkey;
 mod keys;
+mod keysend;
 mod lag;
+mod midi;
+mod notes;
+mod piano;
 mod render;
 mod resample;
 mod state;
@@ -36,6 +40,9 @@ Microphone Editor — микрофон с эффектом лага для Disco
       --catchup-speed 1.1..3.0                   (по умолчанию 1.6)
       --bitrate БИТ/С                            (по умолчанию 64000)
       --clean-start СЕКУНДЫ                      (по умолчанию 1.5)
+  --piano-demo ВЫХОД.wav [--instrument N]
+                                 сыграть короткую мелодию синтезатором
+                                 (проверка SoundFont без MIDI-клавиатуры)
 ";
 
 fn main() {
@@ -62,11 +69,12 @@ fn run_gui() -> Result<()> {
     gui::apply_to_shared(&cfg, &shared);
     let engine = engine::spawn(shared.clone(), cfg.audio_settings());
     hotkey::spawn(shared.clone());
+    midi::spawn(shared.clone());
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Microphone Editor")
-            .with_inner_size([560.0, 840.0])
+            .with_inner_size([600.0, 900.0])
             .with_min_inner_size([480.0, 400.0]),
         ..Default::default()
     };
@@ -94,6 +102,16 @@ fn run_cli(args: &[String]) -> Result<()> {
             for n in outputs {
                 println!("  {n}");
             }
+            Ok(())
+        }
+        "--piano-demo" => {
+            let out = args.get(1).ok_or_else(|| anyhow!("нужно: --piano-demo ВЫХОД.wav"))?;
+            let mut instrument = 0u8;
+            if args.get(2).map(String::as_str) == Some("--instrument") {
+                instrument = args.get(3).ok_or_else(|| anyhow!("нет номера инструмента"))?.parse()?;
+            }
+            render::piano_demo(out, instrument)?;
+            println!("Готово: {out}");
             Ok(())
         }
         "--diagnose" => {
@@ -184,6 +202,20 @@ fn run_diagnose(cfg_path: &std::path::Path, seconds: u64) -> Result<()> {
         if s.callbacks == 0 { "-".to_string() } else { format!("{}..{}", s.min_frames, s.max_frames) }
     };
     for sec in 1..=seconds {
+        // На 2-й секунде зажимаем аккорд, на 4-й отпускаем — проверка, что
+        // синтезатор пианино успевает считать звук.
+        let chord = [60u8, 64, 67, 72];
+        if sec == 2 {
+            println!("     (зажат аккорд C-E-G-C на пианино)");
+            for n in chord {
+                midi::handle_message(&shared, &[0x90, n, 100], false);
+            }
+        }
+        if sec == 4 {
+            for n in chord {
+                midi::handle_message(&shared, &[0x80, n, 0], false);
+            }
+        }
         std::thread::sleep(Duration::from_secs(1));
         let i = shared.input_stats.take();
         println!(

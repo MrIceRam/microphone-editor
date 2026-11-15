@@ -1,3 +1,5 @@
 /target
 # Демо-записи, которые генерирует --render
 /samples/
+# SoundFont-файлы большие — каждый скачивает сам
+/soundfonts/

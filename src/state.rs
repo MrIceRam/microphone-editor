@@ -3,9 +3,11 @@
 //! Всё на атомиках, чтобы звуковой поток никогда не ждал блокировок.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
+use crate::keysend::KeyMapper;
 use crate::lag::{LagMode, LagParams};
+use crate::midi::MidiStatus;
 
 /// f32, который можно безопасно менять из разных потоков.
 pub struct AtomicF32(AtomicU32);
@@ -112,6 +114,12 @@ pub struct StatsSnapshot {
     pub channels: u32,
 }
 
+/// Миллисекунды с запуска программы.
+pub fn now_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
 /// Значение `captured_vk`, означающее «назначение клавиши отменено».
 pub const CAPTURE_CANCELLED: u16 = 0xFFFF;
 
@@ -126,6 +134,8 @@ pub struct EngineStatus {
     pub input_name: String,
     pub output_name: Option<String>,
     pub monitor_name: Option<String>,
+    /// Загруженный SoundFont (если пианино со звуком).
+    pub soundfont_name: Option<String>,
 }
 
 pub struct Shared {
@@ -172,6 +182,37 @@ pub struct Shared {
     pub monitor_stats: StreamStats,
     /// Выходы пишут тишину (для диагностики, чтобы никто не слышал звук).
     pub mute_outputs: AtomicBool,
+    /// Когда звук последний раз запускался (мс с запуска программы).
+    pub stream_start_ms: AtomicU64,
+
+    // --- Пианино ---
+    /// Очередь MIDI-сообщений в синтезатор (создаётся звуковым движком).
+    pub piano_tx: Mutex<Option<rtrb::Producer<[u8; 3]>>>,
+    pub piano_enabled: AtomicBool,
+    /// Громкость пианино (множитель).
+    pub piano_volume: AtomicF32,
+    pub piano_program: AtomicU8,
+    pub piano_through_lag: AtomicBool,
+    /// Сдвиг нот в полутонах.
+    pub piano_transpose: AtomicI32,
+    /// В наушниках слышен свой голос (весь микс, как в Discord).
+    pub monitor_voice: AtomicBool,
+    /// В наушниках слышно пианино.
+    pub monitor_piano: AtomicBool,
+
+    // --- MIDI ---
+    pub midi_device: Mutex<String>,
+    pub midi_status: Mutex<MidiStatus>,
+    /// Какие ноты сейчас зажаты (128 бит).
+    notes_down: [AtomicU64; 2],
+    pub pedal_down: AtomicBool,
+    pub last_note: AtomicI16,
+    pub last_velocity: AtomicU8,
+    /// Окно ждёт ноту для новой привязки.
+    pub learn_note: AtomicBool,
+    /// Пойманная нота (-1 — ещё нет).
+    pub learned_note: AtomicI16,
+    pub keymapper: Mutex<KeyMapper>,
 }
 
 impl Shared {
@@ -199,7 +240,54 @@ impl Shared {
             main_stats: StreamStats::new(),
             monitor_stats: StreamStats::new(),
             mute_outputs: AtomicBool::new(false),
+            stream_start_ms: AtomicU64::new(0),
+            piano_tx: Mutex::new(None),
+            piano_enabled: AtomicBool::new(true),
+            piano_volume: AtomicF32::new(0.7),
+            piano_program: AtomicU8::new(0),
+            piano_through_lag: AtomicBool::new(false),
+            piano_transpose: AtomicI32::new(0),
+            monitor_voice: AtomicBool::new(false),
+            monitor_piano: AtomicBool::new(true),
+            midi_device: Mutex::new(String::new()),
+            midi_status: Mutex::new(MidiStatus::default()),
+            notes_down: [AtomicU64::new(0), AtomicU64::new(0)],
+            pedal_down: AtomicBool::new(false),
+            last_note: AtomicI16::new(-1),
+            last_velocity: AtomicU8::new(0),
+            learn_note: AtomicBool::new(false),
+            learned_note: AtomicI16::new(-1),
+            keymapper: Mutex::new(KeyMapper::new()),
         }
+    }
+
+    /// Первая секунда после запуска звука: устройства «разгоняются», единичные
+    /// сбои в это время нормальны и в общий счётчик не идут.
+    pub fn in_warmup(&self) -> bool {
+        now_ms().saturating_sub(self.stream_start_ms.load(Ordering::Relaxed)) < 1000
+    }
+
+    pub fn set_note_down(&self, note: u8, down: bool) {
+        let note = note & 127;
+        let bit = 1u64 << (note % 64);
+        let word = &self.notes_down[(note / 64) as usize];
+        if down {
+            word.fetch_or(bit, Ordering::Relaxed);
+        } else {
+            word.fetch_and(!bit, Ordering::Relaxed);
+        }
+    }
+
+    pub fn note_is_down(&self, note: u8) -> bool {
+        let note = note & 127;
+        self.notes_down[(note / 64) as usize].load(Ordering::Relaxed) & (1u64 << (note % 64)) != 0
+    }
+
+    pub fn clear_notes(&self) {
+        for w in &self.notes_down {
+            w.store(0, Ordering::Relaxed);
+        }
+        self.pedal_down.store(false, Ordering::Relaxed);
     }
 
     pub fn lag_active(&self) -> bool {

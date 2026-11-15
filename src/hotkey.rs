@@ -46,8 +46,8 @@ fn run(shared: Arc<Shared>) {
                 continue;
             }
             if let Some(vk) = keys::capturable_keys().find(|&vk| is_down(vk)) {
+                // Куда пойдёт клавиша (лаг, нота, педаль) — решает окно.
                 shared.captured_vk.store(vk, Ordering::Relaxed);
-                shared.hotkey_vk.store(vk, Ordering::Relaxed);
                 shared.capturing.store(false, Ordering::Relaxed);
                 capture_armed = false;
                 // Чтобы то же нажатие сразу не включило лаг.
