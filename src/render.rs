@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::lag::{FRAME, LagEngine, LagMode, LagParams, SAMPLE_RATE};
 use crate::piano::{self, PianoSynth};
+use crate::voice_fx::{Denoiser, FxEngine, VoiceFx};
 use crate::resample::PushResampler;
 
 pub struct RenderOptions {
@@ -63,6 +64,57 @@ pub fn render(o: &RenderOptions) -> Result<()> {
     }
 
     write_wav(&o.output, &out)
+}
+
+/// WAV -> 48 кГц моно.
+fn read_wav_48k(path: &str) -> Result<Vec<f32>> {
+    let mut reader = hound::WavReader::open(path).with_context(|| format!("не открыть {path}"))?;
+    let spec = reader.spec();
+    let ch = spec.channels.max(1) as usize;
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader.samples::<f32>().collect::<Result<_, _>>()?,
+        hound::SampleFormat::Int => {
+            let scale = 1.0 / (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader.samples::<i32>().map(|s| s.map(|v| v as f32 * scale)).collect::<Result<_, _>>()?
+        }
+    };
+    let mono: Vec<f32> = samples.chunks(ch).map(|f| f.iter().sum::<f32>() / ch as f32).collect();
+    let mut out = Vec::with_capacity(mono.len() * 2);
+    PushResampler::new(spec.sample_rate, SAMPLE_RATE).process(&mono, &mut out);
+    Ok(out)
+}
+
+/// Прогоняет WAV через эффект голоса (и шумоподавление). `add_noise` подмешивает
+/// шум вентилятора, чтобы послушать, как работает шумоподавление.
+pub fn fx_demo(input: &str, output: &str, fx: VoiceFx, denoise: bool, add_noise: bool) -> Result<()> {
+    let mut audio = read_wav_48k(input)?;
+    let frames = audio.len().div_ceil(FRAME) + 25;
+    audio.resize(frames * FRAME, 0.0);
+    if add_noise {
+        // «Вентилятор»: шум, сглаженный в низкий гул, плюс немного шипения.
+        let (mut rng, mut low) = (0x2468_ACE1u32, 0.0f32);
+        for s in audio.iter_mut() {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            let white = (rng as f32 / u32::MAX as f32) * 2.0 - 1.0;
+            low += (white - low) * 0.02;
+            *s += low * 0.25 + white * 0.015;
+        }
+    }
+    let mut fx_engine = FxEngine::new();
+    let mut den = Denoiser::new();
+    let mut out = Vec::with_capacity(audio.len());
+    for chunk in audio.chunks_exact(FRAME) {
+        let mut f = [0.0f32; FRAME];
+        f.copy_from_slice(chunk);
+        if denoise {
+            den.process(&mut f, 1.0);
+        }
+        fx_engine.process(&mut f, fx, 1.0);
+        out.extend_from_slice(&f);
+    }
+    write_wav(output, &out)
 }
 
 pub fn write_wav(path: &str, samples: &[f32]) -> Result<()> {

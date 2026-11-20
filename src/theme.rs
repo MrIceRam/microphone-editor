@@ -54,8 +54,8 @@ pub fn apply(ctx: &egui::Context) {
         s.item_spacing = egui::vec2(8.0, 8.0);
         s.button_padding = egui::vec2(12.0, 5.0);
         s.interact_size.y = 28.0;
-        s.slider_width = 260.0;
-        s.combo_width = 260.0;
+        s.slider_width = 190.0;
+        s.combo_width = 230.0;
 
         let v = &mut style.visuals;
         v.panel_fill = BG;

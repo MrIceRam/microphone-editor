@@ -11,8 +11,22 @@ use std::sync::mpsc::Sender;
 use crate::keysend::KeyMapper;
 use crate::lag::{LagMode, LagParams};
 use crate::midi::MidiStatus;
+use crate::overlay::OverlayState;
 use crate::tts;
 use crate::twitch::TwitchStatus;
+
+/// Блокировка, которая не «ломается», если другой поток упал, держа её.
+/// Обычный `lock().unwrap()` в таком случае уронил бы и этот поток —
+/// одна ошибка в синтезаторе закрывала бы всю программу.
+pub trait LockExt<T> {
+    fn lock_ok(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockExt<T> for Mutex<T> {
+    fn lock_ok(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
 
 /// f32, который можно безопасно менять из разных потоков.
 pub struct AtomicF32(AtomicU32);
@@ -222,6 +236,14 @@ pub struct Shared {
     /// Пойманная нота (-1 — ещё нет).
     pub learned_note: AtomicI16,
     pub keymapper: Mutex<KeyMapper>,
+    /// «Клавиши для игр» включены (меняется и из окна, и нотой-переключателем).
+    pub keys_enabled: AtomicBool,
+    /// Нота-переключатель «клавиши для игр» (-1 — нет).
+    pub toggle_note: AtomicI16,
+    /// Звуковой сигнал в наушники: 1 — «включено», 2 — «выключено».
+    pub cue: AtomicU8,
+    /// Синтезатор пианино отключён из-за ошибки.
+    pub piano_failed: AtomicBool,
 
     // --- Twitch ---
     pub twitch_enabled: AtomicBool,
@@ -254,6 +276,22 @@ pub struct Shared {
     pub tts_volume: AtomicF32,
     pub tts_to_mic: AtomicBool,
     pub tts_to_headphones: AtomicBool,
+
+    // --- Эффекты голоса ---
+    pub voice_fx: AtomicU8,
+    /// Сила эффекта 0..1.
+    pub fx_mix: AtomicF32,
+    pub denoise: AtomicBool,
+    /// Сила шумоподавления 0..1.
+    pub denoise_amount: AtomicF32,
+
+    // --- Оверлей для OBS ---
+    pub overlay_enabled: AtomicBool,
+    pub overlay_port: AtomicU32,
+    pub overlay_from: AtomicU8,
+    pub overlay_to: AtomicU8,
+    pub overlay_names: AtomicBool,
+    pub overlay_state: Mutex<OverlayState>,
 
     // --- Окно ---
     /// Повторный запуск программы просит показать окно из трея.
@@ -306,6 +344,10 @@ impl Shared {
             learn_note: AtomicBool::new(false),
             learned_note: AtomicI16::new(-1),
             keymapper: Mutex::new(KeyMapper::new()),
+            keys_enabled: AtomicBool::new(false),
+            toggle_note: AtomicI16::new(-1),
+            cue: AtomicU8::new(0),
+            piano_failed: AtomicBool::new(false),
             twitch_enabled: AtomicBool::new(false),
             twitch_channel: Mutex::new(String::new()),
             twitch_reward: Mutex::new(String::new()),
@@ -326,6 +368,16 @@ impl Shared {
             tts_volume: AtomicF32::new(0.8),
             tts_to_mic: AtomicBool::new(true),
             tts_to_headphones: AtomicBool::new(true),
+            voice_fx: AtomicU8::new(0),
+            fx_mix: AtomicF32::new(1.0),
+            denoise: AtomicBool::new(false),
+            denoise_amount: AtomicF32::new(1.0),
+            overlay_enabled: AtomicBool::new(false),
+            overlay_port: AtomicU32::new(7878),
+            overlay_from: AtomicU8::new(36),
+            overlay_to: AtomicU8::new(96),
+            overlay_names: AtomicBool::new(false),
+            overlay_state: Mutex::new(OverlayState::Off),
             show_request: AtomicBool::new(false),
             egui_ctx: std::sync::OnceLock::new(),
         }
@@ -376,10 +428,10 @@ impl Shared {
     }
 
     pub fn set_status(&self, status: EngineStatus) {
-        *self.status.lock().unwrap() = status;
+        *self.status.lock_ok() = status;
     }
 
     pub fn status(&self) -> EngineStatus {
-        self.status.lock().unwrap().clone()
+        self.status.lock_ok().clone()
     }
 }

@@ -18,8 +18,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
 
+use crate::state::LockExt;
 use crate::lag::{FRAME, LagEngine, SAMPLE_RATE};
 use crate::piano::{self, PianoSynth};
+use crate::voice_fx::{Denoiser, FxEngine, VoiceFx};
 use crate::resample::{PullResampler, PushResampler};
 use crate::state::{AtomicF32, EngineStatus, Shared, StreamStats};
 use crate::virtual_mic;
@@ -205,6 +207,7 @@ fn start(
     let target_fill = (settings.buffer_ms.clamp(10, 300) as usize * SAMPLE_RATE as usize / 1000).max(FRAME / 2);
 
     // --- Синтезатор пианино.
+    shared.piano_failed.store(false, Ordering::Relaxed);
     let synth = if settings.piano {
         match load_synth(&settings.soundfont, sf_cache) {
             Ok((s, name)) => {
@@ -285,10 +288,10 @@ fn start(
     shared.input_stats.channels.store(in_cfg.channels() as u32, Ordering::Relaxed);
     // Очередь нот: MIDI-поток и окно кладут, звуковой поток забирает.
     let (piano_tx, piano_rx) = rtrb::RingBuffer::new(1024);
-    *shared.piano_tx.lock().unwrap() = Some(piano_tx);
+    *shared.piano_tx.lock_ok() = Some(piano_tx);
     // Озвучка сообщений: поток озвучки кладёт звук, звуковой поток забирает.
     let (tts_tx, tts_rx) = rtrb::RingBuffer::new(crate::tts::TTS_RING);
-    *shared.tts_tx.lock().unwrap() = Some(tts_tx);
+    *shared.tts_tx.lock_ok() = Some(tts_tx);
     let processor = Processor::new(in_cfg.sample_rate(), producers, synth, piano_rx, tts_rx, shared.clone())?;
     let in_stream = build_input(&input, &in_cfg, processor, shared.clone())
         .with_context(|| format!("не удалось открыть микрофон «{}»", device_name(&input)))?;
@@ -338,10 +341,15 @@ struct Processor {
     /// Озвучка сообщений за текущий пакет.
     frame_tts: [f32; FRAME],
     lag: LagEngine,
+    denoiser: Option<Denoiser>,
+    fx: FxEngine,
     synth: Option<PianoSynth>,
     piano_rx: rtrb::Consumer<[u8; 3]>,
     tts_rx: rtrb::Consumer<f32>,
     piano_was_enabled: bool,
+    /// Звуковой сигнал в наушники: 0 — нет, 1 — «включено», 2 — «выключено».
+    cue_kind: u8,
+    cue_pos: usize,
     outputs: Vec<(OutputKind, rtrb::Producer<f32>)>,
     shared: Arc<Shared>,
 }
@@ -365,10 +373,14 @@ impl Processor {
             frame_monitor: [0.0; FRAME],
             frame_tts: [0.0; FRAME],
             lag: LagEngine::new()?,
+            denoiser: None,
+            fx: FxEngine::new(),
             synth,
             piano_rx,
             tts_rx,
             piano_was_enabled: true,
+            cue_kind: 0,
+            cue_pos: 0,
             outputs,
             shared,
         })
@@ -388,8 +400,53 @@ impl Processor {
         }
     }
 
-    /// Забирает ноты из очереди и рендерит пакет пианино в `frame_piano`.
+    /// Пианино с защитой: если синтезатор сломается, пианино замолчит,
+    /// а голос, лаг и озвучка продолжат работать.
     fn render_piano(&mut self) {
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.render_piano_inner())).is_ok();
+        if !ok {
+            self.synth = None;
+            self.frame_piano.fill(0.0);
+            self.shared.piano_failed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Сигнал в наушники при переключении «клавиш для игр»:
+    /// два коротких тона, вверх — включено, вниз — выключено.
+    fn add_cue(&mut self) {
+        let req = self.shared.cue.swap(0, Ordering::Relaxed);
+        if req != 0 {
+            self.cue_kind = req;
+            self.cue_pos = 0;
+        }
+        if self.cue_kind == 0 {
+            return;
+        }
+        const TONE: usize = 3840; // 80 мс
+        const GAP: usize = 960; // 20 мс
+        let (f1, f2) = if self.cue_kind == 1 { (660.0, 990.0) } else { (990.0, 660.0) };
+        for m in self.frame_monitor.iter_mut() {
+            let p = self.cue_pos;
+            let (freq, t) = if p < TONE {
+                (f1, p)
+            } else if p < TONE + GAP {
+                self.cue_pos += 1;
+                continue;
+            } else if p < 2 * TONE + GAP {
+                (f2, p - TONE - GAP)
+            } else {
+                self.cue_kind = 0;
+                break;
+            };
+            let env = (t.min(TONE - t) as f32 / 240.0).min(1.0); // мягкие края 5 мс
+            let s = (std::f32::consts::TAU * freq * t as f32 / SAMPLE_RATE as f32).sin() * 0.2 * env;
+            *m = (*m + s).clamp(-1.0, 1.0);
+            self.cue_pos += 1;
+        }
+    }
+
+    /// Забирает ноты из очереди и рендерит пакет пианино в `frame_piano`.
+    fn render_piano_inner(&mut self) {
         let enabled = self.shared.piano_enabled.load(Ordering::Relaxed);
         let transpose = self.shared.piano_transpose.load(Ordering::Relaxed);
         let Some(synth) = self.synth.as_mut() else {
@@ -431,6 +488,17 @@ impl Processor {
                 in_peak = in_peak.max(dst.abs());
             }
             consumed += FRAME;
+
+            // Шумоподавление и эффект голоса — только для голоса, до лага.
+            if self.shared.denoise.load(Ordering::Relaxed) {
+                let amount = self.shared.denoise_amount.get();
+                self.denoiser.get_or_insert_with(Denoiser::new).process(&mut self.frame_in, amount);
+            } else {
+                // Выключили — при следующем включении начнём с чистого листа.
+                self.denoiser = None;
+            }
+            let fx = VoiceFx::from_u8(self.shared.voice_fx.load(Ordering::Relaxed));
+            self.fx.process(&mut self.frame_in, fx, self.shared.fx_mix.get());
 
             // Пианино: либо до эффекта лага (лагает вместе с голосом), либо после.
             self.render_piano();
@@ -483,6 +551,7 @@ impl Processor {
                 }
                 self.frame_monitor[i] = m.clamp(-1.0, 1.0);
             }
+            self.add_cue();
 
             for (kind, prod) in self.outputs.iter_mut() {
                 let frame = match kind {

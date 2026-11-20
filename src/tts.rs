@@ -18,6 +18,7 @@ use windows::Storage::Streams::DataReader;
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 use windows::core::HSTRING;
 
+use crate::state::LockExt;
 use crate::lag::SAMPLE_RATE;
 use crate::resample::PushResampler;
 use crate::state::Shared;
@@ -150,7 +151,7 @@ pub fn prepare_text(text: &str, max_chars: usize) -> String {
 /// Запускает поток озвучки. Сообщения кладутся через `enqueue`.
 pub fn spawn(shared: Arc<Shared>) {
     let (tx, rx) = mpsc::channel::<Job>();
-    *shared.tts_jobs.lock().unwrap() = Some(tx);
+    *shared.tts_jobs.lock_ok() = Some(tx);
     thread::Builder::new()
         .name("tts".into())
         .spawn(move || run(shared, rx))
@@ -162,7 +163,7 @@ pub fn enqueue(shared: &Shared, job: Job) -> bool {
     if shared.tts_queue_len.load(Ordering::Relaxed) >= MAX_QUEUE {
         return false;
     }
-    let guard = shared.tts_jobs.lock().unwrap();
+    let guard = shared.tts_jobs.lock_ok();
     let Some(tx): Option<&Sender<Job>> = guard.as_ref() else { return false };
     if tx.send(job).is_ok() {
         shared.tts_queue_len.fetch_add(1, Ordering::Relaxed);
@@ -177,7 +178,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<Job>) {
     let mut synth = match Synth::new() {
         Ok(s) => s,
         Err(e) => {
-            *shared.tts_error.lock().unwrap() = Some(format!("{e:#}"));
+            *shared.tts_error.lock_ok() = Some(format!("{e:#}"));
             return;
         }
     };
@@ -197,16 +198,16 @@ fn run(shared: Arc<Shared>, rx: Receiver<Job>) {
         shared.tts_queue_len.fetch_sub(1, Ordering::Relaxed);
         shared.tts_skip.store(false, Ordering::Relaxed);
 
-        synth.set_voice(&shared.tts_voice.lock().unwrap().clone());
-        *shared.tts_now.lock().unwrap() = Some(job.label.clone());
+        synth.set_voice(&shared.tts_voice.lock_ok().clone());
+        *shared.tts_now.lock_ok() = Some(job.label.clone());
         match synth.speak(&job.text) {
             Ok(samples) => {
-                *shared.tts_error.lock().unwrap() = None;
+                *shared.tts_error.lock_ok() = None;
                 play(&shared, &samples);
             }
-            Err(e) => *shared.tts_error.lock().unwrap() = Some(format!("Не удалось озвучить: {e:#}")),
+            Err(e) => *shared.tts_error.lock_ok() = Some(format!("Не удалось озвучить: {e:#}")),
         }
-        *shared.tts_now.lock().unwrap() = None;
+        *shared.tts_now.lock_ok() = None;
     }
 }
 
@@ -218,7 +219,7 @@ fn play(shared: &Shared, samples: &[f32]) {
             shared.tts_flush.store(true, Ordering::Relaxed);
             return;
         }
-        let mut guard = shared.tts_tx.lock().unwrap();
+        let mut guard = shared.tts_tx.lock_ok();
         let Some(tx) = guard.as_mut() else {
             // Звук не запущен — нечего ждать.
             return;

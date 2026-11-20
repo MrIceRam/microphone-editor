@@ -14,6 +14,7 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::state::LockExt;
 use crate::state::Shared;
 use crate::tts;
 
@@ -130,7 +131,7 @@ pub fn spawn(shared: Arc<Shared>) {
 }
 
 fn set_state(shared: &Shared, channel: &str, state: ChatState) {
-    let mut st = shared.twitch_status.lock().unwrap();
+    let mut st = shared.twitch_status.lock_ok();
     st.state = state;
     st.channel = channel.to_string();
 }
@@ -138,7 +139,7 @@ fn set_state(shared: &Shared, channel: &str, state: ChatState) {
 fn run(shared: Arc<Shared>) {
     let mut backoff = Duration::from_secs(2);
     loop {
-        let channel = normalize_channel(&shared.twitch_channel.lock().unwrap());
+        let channel = normalize_channel(&shared.twitch_channel.lock_ok());
         if !shared.twitch_enabled.load(Ordering::Relaxed) || channel.is_empty() {
             set_state(&shared, &channel, ChatState::Off);
             thread::sleep(Duration::from_millis(500));
@@ -175,7 +176,7 @@ fn session(shared: &Shared, channel: &str) -> Result<(), String> {
     let mut last_data = Instant::now();
     loop {
         // Настройки поменялись — переподключаемся к другому каналу / выключаемся.
-        let wanted = normalize_channel(&shared.twitch_channel.lock().unwrap());
+        let wanted = normalize_channel(&shared.twitch_channel.lock_ok());
         if !shared.twitch_enabled.load(Ordering::Relaxed) || wanted != channel {
             return Ok(());
         }
@@ -209,11 +210,11 @@ fn handle(shared: &Shared, msg: ChatMessage) {
 
     // Режим «Привязать награду»: запоминаем первую пришедшую награду.
     if shared.twitch_learning.swap(false, Ordering::Relaxed) {
-        *shared.twitch_learned.lock().unwrap() = Some(reward.clone());
-        *shared.twitch_reward.lock().unwrap() = reward.clone();
+        *shared.twitch_learned.lock_ok() = Some(reward.clone());
+        *shared.twitch_reward.lock_ok() = reward.clone();
     }
 
-    let ours = *shared.twitch_reward.lock().unwrap() == reward;
+    let ours = *shared.twitch_reward.lock_ok() == reward;
     let spoken = ours && {
         let max = shared.tts_max_len.load(Ordering::Relaxed) as usize;
         let text = tts::prepare_text(&msg.text, max);
@@ -232,7 +233,7 @@ fn handle(shared: &Shared, msg: ChatMessage) {
             )
     };
 
-    let mut st = shared.twitch_status.lock().unwrap();
+    let mut st = shared.twitch_status.lock_ok();
     st.recent.push_front(RecentReward {
         user: msg.user,
         text: msg.text,

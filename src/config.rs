@@ -13,6 +13,7 @@ use toml_edit::{DocumentMut, Item, Value};
 
 use crate::engine::AudioSettings;
 use crate::lag::LagMode;
+use crate::voice_fx::VoiceFx;
 use crate::{keys, notes};
 
 /// Шаблон файла настроек с комментариями.
@@ -25,6 +26,8 @@ pub struct Config {
     pub lag: LagCfg,
     pub hotkey: HotkeyCfg,
     pub ui: UiCfg,
+    pub effects: EffectsCfg,
+    pub overlay: OverlayCfg,
     pub twitch: TwitchCfg,
     pub piano: PianoCfg,
     pub midi: MidiCfg,
@@ -37,21 +40,33 @@ pub struct Config {
 pub enum Tab {
     #[default]
     Lag,
+    Effects,
     Piano,
     Keys,
     Twitch,
+    Overlay,
     Devices,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [Tab::Lag, Tab::Piano, Tab::Keys, Tab::Twitch, Tab::Devices];
+    pub const ALL: [Tab; 7] = [
+        Tab::Lag,
+        Tab::Effects,
+        Tab::Piano,
+        Tab::Keys,
+        Tab::Twitch,
+        Tab::Overlay,
+        Tab::Devices,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::Lag => "Лаг",
+            Tab::Effects => "Эффекты голоса",
             Tab::Piano => "Пианино",
             Tab::Keys => "Клавиши для игр",
             Tab::Twitch => "Twitch",
+            Tab::Overlay => "Оверлей для OBS",
             Tab::Devices => "Устройства",
         }
     }
@@ -59,10 +74,54 @@ impl Tab {
     fn config_name(self) -> &'static str {
         match self {
             Tab::Lag => "lag",
+            Tab::Effects => "effects",
             Tab::Piano => "piano",
             Tab::Keys => "keys",
             Tab::Twitch => "twitch",
+            Tab::Overlay => "overlay",
             Tab::Devices => "devices",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct EffectsCfg {
+    pub fx: VoiceFx,
+    pub mix: u32,
+    pub denoise: bool,
+    pub denoise_amount: u32,
+}
+
+impl Default for EffectsCfg {
+    fn default() -> Self {
+        Self {
+            fx: VoiceFx::None,
+            mix: 100,
+            denoise: false,
+            denoise_amount: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct OverlayCfg {
+    pub enabled: bool,
+    pub port: u32,
+    pub from: String,
+    pub to: String,
+    pub names: bool,
+}
+
+impl Default for OverlayCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: 7878,
+            from: "C2".into(),
+            to: "C7".into(),
+            names: false,
         }
     }
 }
@@ -135,6 +194,7 @@ pub struct MidiCfg {
     pub device: String,
     pub send_keys: bool,
     pub pedal_key: String,
+    pub toggle_note: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -237,6 +297,10 @@ impl Config {
         p.instrument = p.instrument.min(127);
         p.volume = p.volume.min(100);
         p.transpose = p.transpose.clamp(-24, 24);
+        let e = &mut self.effects;
+        e.mix = e.mix.min(100);
+        e.denoise_amount = e.denoise_amount.min(100);
+        self.overlay.port = self.overlay.port.clamp(1024, 65535);
         let t = &mut self.twitch;
         t.volume = t.volume.min(100);
         t.max_length = t.max_length.clamp(10, 500);
@@ -353,6 +417,19 @@ pub fn save(path: &Path, cfg: &Config) -> Result<()> {
 
     set(&mut doc, "ui", "tab", cfg.ui.tab.config_name().into());
 
+    let e = &cfg.effects;
+    set(&mut doc, "effects", "fx", e.fx.config_name().into());
+    set(&mut doc, "effects", "mix", (e.mix as i64).into());
+    set(&mut doc, "effects", "denoise", e.denoise.into());
+    set(&mut doc, "effects", "denoise_amount", (e.denoise_amount as i64).into());
+
+    let o = &cfg.overlay;
+    set(&mut doc, "overlay", "enabled", o.enabled.into());
+    set(&mut doc, "overlay", "port", (o.port as i64).into());
+    set(&mut doc, "overlay", "from", o.from.as_str().into());
+    set(&mut doc, "overlay", "to", o.to.as_str().into());
+    set(&mut doc, "overlay", "names", o.names.into());
+
     let t = &cfg.twitch;
     set(&mut doc, "twitch", "enabled", t.enabled.into());
     set(&mut doc, "twitch", "channel", t.channel.as_str().into());
@@ -377,6 +454,7 @@ pub fn save(path: &Path, cfg: &Config) -> Result<()> {
     set(&mut doc, "midi", "device", m.device.as_str().into());
     set(&mut doc, "midi", "send_keys", m.send_keys.into());
     set(&mut doc, "midi", "pedal_key", m.pedal_key.as_str().into());
+    set(&mut doc, "midi", "toggle_note", m.toggle_note.as_str().into());
 
     // Привязки переписываем целиком, по возрастанию нот.
     let root = doc.as_table_mut();
@@ -449,6 +527,7 @@ mod tests {
         cfg.piano.transpose = -12;
         cfg.midi.send_keys = true;
         cfg.midi.pedal_key = "LShift".into();
+        cfg.midi.toggle_note = "C7".into();
         cfg.keymap.insert("E4".into(), "W".into());
         cfg.keymap.insert("C#4".into(), "Mouse2".into());
         cfg.keymap.insert("C4".into(), "Q".into());

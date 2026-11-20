@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod crash;
 mod engine;
 mod gui;
 mod hotkey;
@@ -15,11 +16,13 @@ mod render;
 mod resample;
 mod single_instance;
 mod state;
+mod overlay;
 mod theme;
 mod tray;
 mod tts;
 mod twitch;
 mod virtual_mic;
+mod voice_fx;
 
 use std::sync::Arc;
 
@@ -51,6 +54,10 @@ Microphone Editor — микрофон с эффектом лага для Disco
   --piano-demo ВЫХОД.wav [--instrument N]
                                  сыграть короткую мелодию синтезатором
                                  (проверка SoundFont без MIDI-клавиатуры)
+  --fx-demo ВХОД.wav ВЫХОД.wav ЭФФЕКТ [--denoise] [--add-noise]
+                                 эффект голоса: none|radio|phone|cave|low|
+                                 high|robot|hamster; --add-noise подмешивает
+                                 шум, --denoise его убирает
   --say \"ТЕКСТ\" [ВЫХОД.wav] [--voice Pavel]
                                  озвучить текст голосом Windows в WAV
   --twitch-watch канал1,канал2 [СЕКУНДЫ]
@@ -59,6 +66,8 @@ Microphone Editor — микрофон с эффектом лага для Disco
 ";
 
 fn main() {
+    // Любая ошибка в любом потоке запишется в crash.log рядом с программой.
+    crash::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.is_empty() {
         attach_console();
@@ -89,6 +98,7 @@ fn run_gui() -> Result<()> {
     midi::spawn(shared.clone());
     tts::spawn(shared.clone());
     twitch::spawn(shared.clone());
+    overlay::spawn(shared.clone());
     single_instance::listen(shared.clone());
 
     let icon = eframe::egui::IconData {
@@ -100,8 +110,8 @@ fn run_gui() -> Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Microphone Editor")
             .with_icon(icon)
-            .with_inner_size([700.0, 760.0])
-            .with_min_inner_size([560.0, 560.0]),
+            .with_inner_size([1160.0, 700.0])
+            .with_min_inner_size([960.0, 560.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -145,6 +155,20 @@ fn run_cli(args: &[String]) -> Result<()> {
                 let verdict = if r.works() { "звук проходит" } else { "звук НЕ проходит" };
                 println!("{} -> {}: пик {:.4}, усиление {:+.1} дБ, {verdict}", m.render, m.capture, r.peak, r.gain_db);
             }
+            Ok(())
+        }
+        "--fx-demo" => {
+            if args.len() < 4 {
+                bail!("нужно: --fx-demo ВХОД.wav ВЫХОД.wav ЭФФЕКТ [--denoise] [--add-noise]");
+            }
+            let fx = voice_fx::VoiceFx::ALL
+                .into_iter()
+                .find(|f| f.config_name() == args[3])
+                .ok_or_else(|| anyhow!("неизвестный эффект {}", args[3]))?;
+            let denoise = args.iter().any(|a| a == "--denoise");
+            let add_noise = args.iter().any(|a| a == "--add-noise");
+            render::fx_demo(&args[1], &args[2], fx, denoise, add_noise)?;
+            println!("Готово: {}", args[2]);
             Ok(())
         }
         "--say" => {
